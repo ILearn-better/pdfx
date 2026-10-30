@@ -1,0 +1,18 @@
+# 启动PDF工具.bat 是 GBK 编码 + CRLF 换行（cmd 按字节偏移解析，UTF-8 中文会错位），
+# 必须按二进制原样存取，否则一 clone 下来中文就成乱码、双击报错。
+*.bat -text
+
+# 其余统一 LF，跨平台差异降到最小
+*.py    text eol=lf
+*.mjs   text eol=lf
+*.js    text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.src   text eol=lf
+.gitignore text eol=lf
+
+# Windows 专用脚本保留 CRLF
+*.ps1   text eol=crlf
+*.cmd   text eol=crlf

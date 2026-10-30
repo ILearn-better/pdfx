@@ -1,0 +1,18 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 离线依赖包（153MB，用 tools/fetch_wheels.py 现抓，不入库）----
+wheels/
+
+# ---- 运行时与调试产物 ----
+tmp/
+*.log
+
+# ---- 系统垃圾 ----
+.DS_Store
+Thumbs.db
+desktop.ini
