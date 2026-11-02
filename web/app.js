@@ -473,6 +473,47 @@
     return [b[0] * k, b[1] * k, (b[2] - b[0]) * k, (b[3] - b[1]) * k];
   }
 
+  /* 拖动预览要把被拖对象那块像素从页面位图上抠下来，得先知道纸张底色，
+     用来盖掉原位残留。取页面四角里最亮的那个，避开页眉横线与边缘阴影。 */
+  let _paperCache = { key: '', color: '#ffffff' };
+  function paperColor(im, ptW, ptH) {
+    if (!im || !im.naturalWidth) return '#ffffff';
+    const key = im.currentSrc || im.src;
+    if (_paperCache.key === key) return _paperCache.color;
+    let color = '#ffffff';
+    try {
+      const c = document.createElement('canvas');
+      c.width = 1; c.height = 1;
+      const t = c.getContext('2d', { willReadFrequently: true });
+      const iw = im.naturalWidth;
+      const ih = im.naturalHeight;
+      let best = -1;
+      [[3, 3], [ptW - 3, 3], [3, ptH - 3], [ptW - 3, ptH - 3]].forEach(([px, py]) => {
+        t.clearRect(0, 0, 1, 1);
+        t.drawImage(im, (px / ptW) * iw, (py / ptH) * ih, 1, 1, 0, 0, 1, 1);
+        const d = t.getImageData(0, 0, 1, 1).data;
+        const s = d[0] + d[1] + d[2];
+        if (s > best) { best = s; color = `rgb(${d[0]},${d[1]},${d[2]})`; }
+      });
+    } catch (e) { /* 读不到就退回白色 */ }
+    _paperCache = { key, color };
+    return color;
+  }
+
+  /* 等页面位图换成新版本后再清实时层。不然松手瞬间会「弹回原位 → 跳到新位置」，
+     中间还夹着一次后端往返，看着就是抖一下。 */
+  async function settlePageImage() {
+    const box = currentBox();
+    const im = box && box.querySelector('img');
+    if (!im || !im.decode) return;
+    try {
+      await Promise.race([
+        im.decode(),
+        new Promise((r) => setTimeout(r, 1500)),
+      ]);
+    } catch (e) { /* 解码失败就靠超时兜底 */ }
+  }
+
   /* ---------------- 画布绘制：base 静态层 + live 实时层 ----------------
    * 分成两层的原因：拖动画笔时若每次都重绘"已提交的全部内容"，
    * 页面上笔画一多就会掉帧。实时操作只碰 live 层 —— 清一块、画一条线，
@@ -680,16 +721,37 @@
       ctx.fillRect(x, y, ww, hh);
     }
 
-    // 移动 / 缩放的实时预览
+    /* 移动 / 缩放的实时预览：把被拖对象那块像素从页面位图上抠下来，跟着指针走。
+       只画一个空框的话，手感就是「框在动、内容没动」，松手再瞬移。 */
     if (S.drag && S.drag.cur) {
       const [x, y, ww, hh] = rectOf(S.drag.cur);
-      ctx.strokeStyle = S.drag.kind === 'resize' ? '#7c3aed' : '#1f6feb';
-      ctx.lineWidth = 1.6;
-      ctx.setLineDash([6, 4]);
-      ctx.strokeRect(x, y, ww, hh);
+      const [ox, oy, ow, oh] = rectOf(S.drag.start);
+      const im = box.querySelector('img');
+      const [ptW, ptH] = sizeOf(S.page);
+      if (im && im.naturalWidth && ww > 0 && hh > 0) {
+        // 1) 先盖掉原位（用纸张底色，不然会看到两个一模一样的对象）
+        ctx.fillStyle = paperColor(im, ptW, ptH);
+        ctx.fillRect(ox - 1, oy - 1, ow + 2, oh + 2);
+        // 2) 再把原像素画到新位置。源矩形用图片的自然像素坐标，
+        //    这样不受 object-fit: contain 留白和 dpr 的影响
+        const iw = im.naturalWidth;
+        const ih = im.naturalHeight;
+        const s = S.drag.start;
+        try {
+          ctx.drawImage(
+            im,
+            (s[0] / ptW) * iw, (s[1] / ptH) * ih,
+            ((s[2] - s[0]) / ptW) * iw, ((s[3] - s[1]) / ptH) * ih,
+            x, y, ww, hh,
+          );
+        } catch (e) { /* 源矩形偶尔越界，忽略这一帧 */ }
+      }
+      // 3) 细边框 + 手柄，别用半透明填充盖住内容
       ctx.setLineDash([]);
-      ctx.fillStyle = S.drag.kind === 'resize' ? 'rgba(124,58,237,.07)' : 'rgba(31,111,235,.06)';
-      ctx.fillRect(x, y, ww, hh);
+      ctx.strokeStyle = S.drag.kind === 'resize' ? '#7c3aed' : '#1f6feb';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x + 0.5, y + 0.5, Math.max(0, ww - 1), Math.max(0, hh - 1));
+      if (S.tool === 'select') drawHandles(ctx, S.drag.cur, k);
     }
   }
 
@@ -1274,9 +1336,13 @@
 
     if (S.drag) {
       const d = S.drag;
-      S.drag = null;
-      if (d.moved) await commitDrag(d);
-      else { paint('both'); }
+      if (d.moved) {
+        // 故意不清 S.drag：预览要一直停在松手的位置，等新位图就绪由 commitDrag 收尾
+        await commitDrag(d);
+      } else {
+        S.drag = null;
+        paint('both');
+      }
     }
   }
 
@@ -1348,16 +1414,18 @@
     } catch (e) { toast(e.message, 'err'); }
   }
 
-  /* 移动 / 缩放的提交：松手才落库，过程中只在画布上预览 */
+  /* 移动 / 缩放的提交：松手才落库，过程中只在画布上预览。
+     预览一直保留到新位图就绪（settlePageImage），避免松手瞬间弹回原位。 */
   async function commitDrag(d) {
     const o = d.obj;
-    if (!o) { paint('both'); return; }
+    if (!o) { S.drag = null; paint('both'); return; }
     // 只有文本和图片支持变换，别的类型直接放弃预览
-    if (o.kind !== 'text' && o.kind !== 'image') { paint('both'); return; }
+    if (o.kind !== 'text' && o.kind !== 'image') { S.drag = null; paint('both'); return; }
     const rect = d.cur;
     if (d.kind === 'move'
       && Math.abs(rect[0] - d.start[0]) < 0.4
       && Math.abs(rect[1] - d.start[1]) < 0.4) {
+      S.drag = null;
       paint('both');
       return;
     }
@@ -1396,6 +1464,9 @@
         if (d < best) { best = d; near = x; }
       });
       S.sel = near && best < 60 ? { kind: o.kind, ...near } : null;
+      // 预览留在新位置，等页面位图换成新版再收起 —— 中间这段用户看不到任何跳变
+      await settlePageImage();
+      S.drag = null;
       paint('both');
       renderObjList();
       renderProps();
@@ -1403,6 +1474,8 @@
     } catch (e) {
       toast(e.message, 'err');
       await afterContentChange();
+      await settlePageImage();
+      S.drag = null;
       paint('both');
     }
   }

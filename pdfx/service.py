@@ -144,6 +144,18 @@ def create_app(initial: str | None = None) -> Flask:
     app.config["JSON_AS_ASCII"] = False
     app.json.ensure_ascii = False
 
+    @app.after_request
+    def _no_api_cache(resp):
+        """JSON 接口必须每次拿到最新状态。
+
+        浏览器对没有缓存头的响应会做启发式缓存，拖动提交后前端再查对象列表
+        可能拿到拖之前那一份 —— 表现是「东西挪了，但选框和属性还停在原位」。
+        页面位图靠 URL 里的 v=版本号 规避，接口这边显式禁用。
+        """
+        if request.path.startswith("/api/"):
+            resp.headers["Cache-Control"] = "no-store, max-age=0"
+        return resp
+
     # ------------------------------------------------------------------ 页面
     @app.get("/")
     def index():

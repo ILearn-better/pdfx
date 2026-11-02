@@ -455,6 +455,29 @@ class TextMixin:
                 text=fitz.PDF_REDACT_TEXT_REMOVE,
             )
 
+    def _paper_color(self, page: fitz.Page) -> tuple[float, float, float]:
+        """页面纸张底色：低分辨率渲染整页后取四角最亮者。
+
+        专门用于「移动元素后擦掉原位」。不能复用 `_bg_color` —— 那个取的是
+        区域边缘的众数色，而被移动的那块本来就是图片自己，取出来就是图片的颜色，
+        涂上去等于用图盖图，原位会留下一个一模一样的残影。
+        """
+        try:
+            pix = page.get_pixmap(dpi=24, colorspace=fitz.csRGB, alpha=False)
+            w, h, n = pix.width, pix.height, pix.n
+            if w < 3 or h < 3:
+                return (1.0, 1.0, 1.0)
+            s = pix.samples
+            best, best_sum = (255, 255, 255), -1
+            for x, y in ((1, 1), (w - 2, 1), (1, h - 2), (w - 2, h - 2)):
+                i = (y * w + x) * n
+                c = (s[i], s[i + 1], s[i + 2])
+                if sum(c) > best_sum:
+                    best, best_sum = c, sum(c)
+            return (best[0] / 255.0, best[1] / 255.0, best[2] / 255.0)
+        except Exception:
+            return (1.0, 1.0, 1.0)
+
     def _bg_color(self, page: fitz.Page, bbox: Sequence[float]) -> tuple[float, float, float]:
         """采样区域边缘的众数颜色，作为"抹除"扫描件文字时的底色。"""
         try:
@@ -651,7 +674,8 @@ class TextMixin:
         }
         self._pstate(page)["texts"].append(rec)
         self._dirty = True
-        return rec
+        # 同样返回副本：后续 update/transform 会原地改写内部记录
+        return dict(rec)
 
     # ---------------------------------------------------------------- 改
     def update_text(
@@ -975,7 +999,9 @@ class ImageMixin:
         }
         self._pstate(page)["images"].append(rec)
         self._dirty = True
-        return rec
+        # 返回副本：这份记录后续会被 transform / replace 原地更新，
+        # 直接把内部 dict 交出去的话，调用方拿到的"插入时 bbox"会自己变掉
+        return dict(rec)
 
     def replace_image(self, page_no: int, target: Any, src: Any, keep_ratio: bool = True) -> dict[str, Any]:
         items = self.list_images(page_no)["items"]
@@ -984,10 +1010,13 @@ class ImageMixin:
         self._push_undo()
         page = self.page(page_no)
 
-        # 一律用色块盖住旧图再重绘。不要按 xref 删：
+        # 一律用纸色块盖住旧图再重绘。不要按 xref 删：
         # 相同字节的图片会共享 xref，删一次会连页面原有的图一起带走。
+        # 颜色必须取"页面纸张底色"而不是 _bg_color（区域边缘众数色）——
+        # 那块区域整个就是旧图自己，取出来是图片的颜色，等于用图盖图：
+        # 当下看着正常（新图压在上面），但日后这层色块会变成一模一样的残影。
         old = _rect_list(fitz.Rect(*item["bbox"]))
-        self._cover(page, old)
+        self._cover(page, old, color=self._paper_color(page))
         if item["source"] == "user":
             self._suppress(page, old)  # 用户图重绘在别处时，旧实例也要从列表里退场
         r = fitz.Rect(*old)
@@ -1024,9 +1053,10 @@ class ImageMixin:
                 )
                 done = "purged"
             except Exception:
-                self._cover(page, rect)
+                self._cover(page, rect, color=self._paper_color(page))
         else:
-            self._cover(page, rect)
+            # 同样要用纸色：这块区域就是图片本身，取局部边缘色等于把图涂回原位
+            self._cover(page, rect, color=self._paper_color(page))
 
         st = self._pstate(page)
         st["images"] = [r for r in st.get("images", []) if r["id"] != item["id"]]
@@ -1055,12 +1085,55 @@ class ImageMixin:
             raise PdfxError("该图片无法提取原始数据（可能是矢量蒙版）", "image_extract_failed")
         self._push_undo()
         old = _rect_list(fitz.Rect(*item["bbox"]))
-        self._cover(page, old)
-        self._suppress(page, old)
+        old_rect = fitz.Rect(*old)
+        # 整页的底图（扫描页那张大图）不是"可移动的元素"，误删等于把整页擦掉
+        if old_rect.get_area() > page.rect.get_area() * 0.6:
+            raise PdfxError(
+                "这看起来是整页的底图（扫描页那张大图），不能整体移动",
+                "image_is_background",
+            )
+        # 把原图从这一页真正删掉，而不是涂一块色块盖住：
+        # 底下被它遮住的文字会自然露出来，也不会留下白斑。
+        # 用 redaction 删掉这块区域里的图像，文字与矢量线条原样保留。
+        # 不要靠"xref 是否唯一"来决定要不要删：同样字节的图会被 PyMuPDF 复用成
+        # 同一个 xref，replace_image 之后同一位置甚至叠着两个实例，判断必然失手，
+        # 结果退回涂色又被上层实例盖住 → 原位残留一个一模一样的残影。
+        try:
+            page.add_redact_annot(old_rect)
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_REMOVE,
+                text=fitz.PDF_REDACT_TEXT_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+            )
+        except Exception:
+            # redaction 失败就退化为用页面纸张底色盖住（至少不会两个影子）
+            self._cover(page, old, color=self._paper_color(page))
+            self._suppress(page, old)
         r = fitz.Rect(*norm_rect(rect))
         xref = page.insert_image(r, stream=data, keep_proportion=bool(keep_ratio), overlay=True)
-        taken = [rec["bbox"] for rec in self._pstate(page).get("images", []) if rec["id"] != item["id"]]
-        bbox = self._instance_near(page, r, taken=taken)
+        # 不能拿 get_image_info 回查实际 bbox：这一页的内容流刚被 redaction 重写过，
+        # PyMuPDF 那边返回的可能还是改动前的快照（新图压根不在列表里），
+        # 于是会把旧位置的 bbox 写回记录，界面上就出现"图挪了、框还留在原地"。
+        # 按 insert_image 的居中适配规则自己算，稳定且没有往返。
+        iw = int(item.get("pixel_width") or 0)
+        ih = int(item.get("pixel_height") or 0)
+        if not iw or not ih:
+            try:
+                pm = fitz.Pixmap(data)
+                iw, ih = pm.width, pm.height
+            except Exception:
+                iw = ih = 0
+        if keep_ratio and iw > 0 and ih > 0 and r.width > 0 and r.height > 0:
+            ar = iw / ih
+            w, h = r.width, r.height
+            if w / h > ar:
+                w = h * ar
+            else:
+                h = w / ar
+            dx, dy = (r.width - w) / 2, (r.height - h) / 2
+            bbox = _rect_list(fitz.Rect(r.x0 + dx, r.y0 + dy, r.x0 + dx + w, r.y0 + dy + h))
+        else:
+            bbox = _rect_list(r)
         st = self._pstate(page)
         for rec in st.get("images", []):
             if rec["id"] == item["id"]:

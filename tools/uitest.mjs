@@ -593,7 +593,45 @@ async function main() {
     imgMove.err || `${JSON.stringify(imgMove.before)} → ${JSON.stringify(imgMove.after)}`);
   check('拖动后选中的仍是图片而不是底下文字', !/文本内容/.test(imgMove.props || ''),
     (imgMove.props || '').replace(/\s+/g, ' ').slice(0, 56));
+  const oldBox = imgMove.before;
   await shot('image-moved');
+
+  // 移动后原位不能留下"另一个一模一样的图"。
+  // 曾经的实现用图片自己区域的边缘色去涂原位，取到的就是图片的颜色，等于没涂。
+  const ghost = await ev(`(async () => {
+    const im = document.querySelector('#pages .pbox.current img');
+    if (!im) return { err: '找不到页面位图' };
+    try { await im.decode(); } catch (e) {}
+    const doc = (await (await fetch('/api/docs')).json()).data.current;
+    const size = (await (await fetch('/api/doc?doc=' + doc)).json()).data.pages[0].size;
+    const c = document.createElement('canvas');
+    c.width = size[0]; c.height = size[1];
+    const g = c.getContext('2d');
+    g.drawImage(im, 0, 0, size[0], size[1]);
+    const b = [${oldBox.join(',')}];
+    // 内缩 6px：bbox 取整后边缘那圈必然压在新图边界上，算进去会误判成残影
+    const x = Math.round(b[0]) + 6, y = Math.round(b[1]) + 6;
+    const w = Math.max(1, Math.round(b[2] - b[0]) - 12);
+    const h = Math.max(1, Math.round(b[3] - b[1]) - 12);
+    // 新旧位置常常重叠，重叠区里的蓝色属于"搬到这儿的图"，不算残影
+    const cur = (await (await fetch('/api/image?page=0&doc=' + doc)).json()).data.items
+      .filter((it) => it.source === 'user').pop();
+    const nb = cur ? cur.bbox : null;
+    const d = g.getImageData(x, y, w, h).data;
+    let blue = 0, seen = 0;
+    for (let py = 0; py < h; py++) {
+      for (let px = 0; px < w; px++) {
+        const ax = x + px, ay = y + py;
+        if (nb && ax >= nb[0] && ax <= nb[2] && ay >= nb[1] && ay <= nb[3]) continue;
+        seen++;
+        const i = (py * w + px) * 4;
+        if (d[i + 2] > 150 && d[i] < 110 && d[i + 1] < 160) blue++;
+      }
+    }
+    return { blue, total: seen };
+  })()`);
+  check('移动后原位没有图片残影', ghost.blue != null && ghost.total > 0 && ghost.blue / ghost.total < 0.02,
+    ghost.err || `原位蓝色像素 ${ghost.blue} / ${ghost.total}（${(100 * ghost.blue / Math.max(1, ghost.total)).toFixed(1)}%）`);
 
   // ---- 三种浏览方式 ----
   console.log('\n== 浏览方式 ==');

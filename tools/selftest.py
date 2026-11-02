@@ -88,6 +88,31 @@ def main() -> int:
     tr = d.transform_image(0, im["id"], [100, 620, 200, 680])
     ok("移动图片", tr["bbox"][0] == 100, f"bbox={tr['bbox']}")
 
+    # 移动后原位必须干净。曾经的实现是用"区域边缘众数色"涂盖原位 ——
+    # 而那片区域整个就是被移动的那张图，取到的自然是图片自己的颜色，
+    # 等于用图盖图，原位留下一个一模一样的残影。
+    # 判据：原位置的像素要回到"从没插过图片时的样子"。和原始样本比对，
+    # 不能只看暗像素多不多 —— 那个位置本来就有正文，露出来才是对的。
+    try:
+        import fitz
+        import numpy as np
+
+        def rgb(doc):
+            pm = fitz.Pixmap(doc.render(0, dpi=72))
+            return np.frombuffer(pm.samples, dtype=np.uint8).reshape(pm.height, pm.width, pm.n)[:, :, :3].astype(int)
+
+        orig = PDFDocument(str(ROOT / "samples" / "sample_text.pdf"))
+        a_orig = rgb(orig)
+        orig.close()
+        a_now = rgb(d)
+        ox0, oy0, ox1, oy1 = [int(v) for v in im["bbox"]]
+        patch_now = a_now[oy0 + 4 : oy1 - 4, ox0 + 4 : ox1 - 4]
+        patch_orig = a_orig[oy0 + 4 : oy1 - 4, ox0 + 4 : ox1 - 4]
+        diff = float(np.abs(patch_now - patch_orig).mean())
+        ok("移动后原位无残影", diff < 8, f"与原始页面平均差 {diff:.1f}（图涂回原位会到 100+）")
+    except ImportError:
+        pass
+
     # 界面上的"拖手柄"走的就是这两个入口：给 rect 即移动/缩放，不传 rect 才是改内容
     tf = d.transform_text(0, u.get("id") or t["id"], rect=[u["bbox"][0], u["bbox"][1] + 90, u["bbox"][2] + 40, u["bbox"][3] + 90])
     ok("移动文本", abs(tf["bbox"][1] - (u["bbox"][1] + 90)) < 6, f"y {u['bbox'][1]:.0f} → {tf['bbox'][1]:.0f}")
