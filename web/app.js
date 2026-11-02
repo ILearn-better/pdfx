@@ -935,31 +935,35 @@
     return best;
   }
 
+  /* 命中测试：按「视觉层叠顺序」从上往下找。
+     用户插入的图片/文本压在 PDF 原有内容之上；如果按面积取最小，
+     点到图片中心时会选中它底下那行小字 —— 表现就是「图片拖不动」。 */
   function hitTest(pt) {
-    let best = null;
-    let bestArea = Infinity;
-    S.objs.texts.forEach((t) => {
-      const b = t.bbox;
-      if (inBbox(pt, b)) {
-        const a = (b[2] - b[0]) * (b[3] - b[1]);
-        if (a < bestArea) { best = { kind: 'text', ...t }; bestArea = a; }
-      }
-    });
-    if (best) return best;
-    S.objs.images.forEach((im) => {
-      const b = im.bbox;
-      if (inBbox(pt, b)) {
-        const a = (b[2] - b[0]) * (b[3] - b[1]);
-        if (a < bestArea) { best = { kind: 'image', ...im }; bestArea = a; }
-      }
-    });
-    if (best) return best;
-    for (const st of S.objs.strokes) {
-      for (const p of st.points) {
+    // 1) 笔迹在最上层：命中范围只有 5pt，点到就算
+    for (const st of (S.objs.strokes || [])) {
+      for (const p of st.points || []) {
         if (Math.abs(p[0] - pt[0]) < 5 && Math.abs(p[1] - pt[1]) < 5) return { kind: 'stroke', ...st };
       }
     }
-    return null;
+    // 2) 文本与图片一起排序：用户插入的优先；同一层里比面积（小的更精确）
+    const cands = [];
+    (S.objs.texts || []).forEach((t) => {
+      if (inBbox(pt, t.bbox)) cands.push({ kind: 'text', ...t });
+    });
+    (S.objs.images || []).forEach((im) => {
+      if (inBbox(pt, im.bbox)) cands.push({ kind: 'image', ...im });
+    });
+    if (!cands.length) return null;
+    if (cands.length > 1) {
+      const area = (o) => Math.max(1, (o.bbox[2] - o.bbox[0]) * (o.bbox[3] - o.bbox[1]));
+      cands.sort((a, b) => {
+        const ua = a.source === 'user' ? 1 : 0;
+        const ub = b.source === 'user' ? 1 : 0;
+        if (ua !== ub) return ub - ua;
+        return area(a) - area(b);
+      });
+    }
+    return cands[0];
   }
 
   /* 视口中心对应的页面坐标：插入的图片/文本落在你正在看的地方，而不是页面正中 */
@@ -1052,11 +1056,15 @@
       const hit = hitTest(pt);
       if (hit) {
         S.sel = hit;
-        S.drag = {
-          kind: 'move', dir: [0, 0], obj: hit, start: hit.bbox.slice(),
-          cur: hit.bbox.slice(), anchor: pt, size: hit.size || null,
-          keep: hit.kind === 'image', moved: false,
-        };
+        // 笔迹只支持选中后删除，没有"拖动"这回事——给它建 drag 会让松手时
+        // 拿笔迹 id 去调 /api/image，白报一个错
+        if (hit.kind !== 'stroke') {
+          S.drag = {
+            kind: 'move', dir: [0, 0], obj: hit, start: hit.bbox.slice(),
+            cur: hit.bbox.slice(), anchor: pt, size: hit.size || null,
+            keep: hit.kind === 'image', moved: false,
+          };
+        }
         renderObjList();
         renderProps();
         showTab('props');
@@ -1344,6 +1352,8 @@
   async function commitDrag(d) {
     const o = d.obj;
     if (!o) { paint('both'); return; }
+    // 只有文本和图片支持变换，别的类型直接放弃预览
+    if (o.kind !== 'text' && o.kind !== 'image') { paint('both'); return; }
     const rect = d.cur;
     if (d.kind === 'move'
       && Math.abs(rect[0] - d.start[0]) < 0.4

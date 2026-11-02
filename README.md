@@ -263,7 +263,7 @@ python tools/install_skill.py
 python tools/make_samples.py     # 生成三类样本（结构化 / 扫描 / 混合）
 python tools/selftest.py         # 端到端 47 项，纯 Python API
 python tools/api_smoke.py        # HTTP 19 项，自动起停独立服务
-node   tools/uitest.mjs          # 界面 47 项，真实浏览器点击/拖拽/触摸（需 node 18+ 与 Edge/Chrome）
+node   tools/uitest.mjs          # 界面 49 项，真实浏览器点击/拖拽/触摸（需 node 18+ 与 Edge/Chrome）
 ```
 
 - `selftest.py` 按「创建与导入 → 增 → 改 → 删 → 查 → 保存/重开/撤销 → 异常处理」
@@ -272,10 +272,12 @@ node   tools/uitest.mjs          # 界面 47 项，真实浏览器点击/拖拽/
   不会污染 `samples/` 里的正式样本；不带参数时**自己起一个随机端口的服务**，
   不会去连你可能正在用的 8765 实例。
 - `uitest.mjs` 用 CDP 驱动无头 Edge，真派发 PointerEvent 测「新建 → 画笔 → 流畅度 →
-  撤销 → 橡皮即时切断 → 文本框插入/移动/缩放 → 图片直接插入/缩放 → 三种视图 →
+  撤销 → 橡皮即时切断 → 文本框插入/移动/缩放 → 图片直接插入/缩放/整体拖动 → 三种视图 →
   文档切换 → 另存为对话框 → 插入 PDF → 橡皮擦页面内容 → 触摸书写」，截图写到 `tmp/shots/`。
   几条专门的守门断言：
   - `elementFromPoint` 检查画布没被其他元素遮挡 —— DOM 里存在不等于用户看得见
   - 书写过程中 `base` 层像素数**完全不变**、`live` 层有内容 —— 这是"分层重绘"的直接证据
   - 页面已有 9 条笔迹时，200 次指针移动的处理耗时要 < 200ms —— 这是"跟手"的量化形式
   - 触摸模拟下 `pointercancel` 必须为 0 —— 一旦浏览器把手势当滚动抢走，画笔只剩两个点、橡皮完全不响应
+  - 图片中心压着正文时，拖动后位移必须 > 8pt 且属性面板仍显示「位置/尺寸」而不是「文本内容」
+    —— 命中若按面积挑最小对象，拖的会是底下那行小字

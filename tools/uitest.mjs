@@ -558,6 +558,43 @@ async function main() {
     imgScale.err || `${JSON.stringify(imgScale.before)} → ${JSON.stringify(imgScale.after)}`);
   await shot('image-scaled');
 
+  // 图片中心压在正文上时，命中必须按层叠顺序（图片在上）而不是按面积挑小的，
+  // 否则拖的是底下那行小字，图片纹丝不动
+  const imgMove = await ev(`(async () => {
+    const mk = (t, x, y, b, pid) => new PointerEvent(t, { clientX: x, clientY: y, bubbles: true, cancelable: true, pointerId: pid, pointerType: 'mouse', isPrimary: true, button: 0, buttons: b });
+    const doc = (await (await fetch('/api/docs')).json()).data.current;
+    const size = (await (await fetch('/api/doc?doc=' + doc)).json()).data.pages[0].size;
+    const grab = async () => {
+      const j = await (await fetch('/api/image?page=0&doc=' + doc)).json();
+      return j.data.items.filter(x => x.source === 'user').pop();
+    };
+    const i0 = await grab();
+    if (!i0) return { err: '找不到图片' };
+    const box = document.querySelector('#pages .pbox.current');
+    const r = box.getBoundingClientRect();
+    const k = r.width / size[0];
+    const b = i0.bbox;
+    const cx = r.left + (b[0] + b[2]) / 2 * k;
+    const cy = r.top + (b[1] + b[3]) / 2 * k;
+    const el = box.querySelector('img');
+    el.dispatchEvent(mk('pointerdown', cx, cy, 1, 61));
+    for (let i = 1; i <= 10; i++) el.dispatchEvent(mk('pointermove', cx + i * 6, cy + i * 4, 1, 61));
+    el.dispatchEvent(mk('pointerup', cx + 60, cy + 40, 0, 61));
+    await new Promise(z => setTimeout(z, 2000));
+    const i1 = await grab();
+    if (!i1) return { err: '拖动后图片丢失' };
+    return {
+      before: b.map(Math.round), after: i1.bbox.map(Math.round),
+      dx: Math.round(i1.bbox[0] - b[0]), dy: Math.round(i1.bbox[1] - b[1]),
+      props: (document.querySelector('#props') || {}).textContent || '',
+    };
+  })()`);
+  check('图片可以整体拖动', imgMove.dx != null && Math.abs(imgMove.dx) > 8 && Math.abs(imgMove.dy) > 5,
+    imgMove.err || `${JSON.stringify(imgMove.before)} → ${JSON.stringify(imgMove.after)}`);
+  check('拖动后选中的仍是图片而不是底下文字', !/文本内容/.test(imgMove.props || ''),
+    (imgMove.props || '').replace(/\s+/g, ' ').slice(0, 56));
+  await shot('image-moved');
+
   // ---- 三种浏览方式 ----
   console.log('\n== 浏览方式 ==');
   const singleBoxes = await ev(`document.querySelectorAll('#pages .pbox').length`);
