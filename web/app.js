@@ -1027,8 +1027,21 @@
      顺序很关键 —— 先把新位图的请求发出去（URL 里的 rev 已由写接口的响应更新），
      再等对象列表回来。反过来做的话，位图要等 JSON 往返完才开始下载，
      一次拖动提交就白等一个来回。 */
+  /* 一旦落笔改了页面，上一轮 OCR 的框就过期了：位图变了，识别结果和
+     实际画面已经对不上。继续拿旧框去框字，就会"框在这里、字在那里"，
+     而且后端每次都要重跑整页识别（1~3 秒）。所以改完先收起，需要时再点
+     「识别本页」—— OCR 只在用户主动要的时候跑。 */
+  function dropStaleOcr() {
+    if (!S.ocrPages.has(S.page)) return;
+    const had = (S.objs.texts || []).some((t) => t.source === 'ocr');
+    S.ocrPages.delete(S.page);
+    syncOcrButton();
+    if (had) toast('页面内容已改，OCR 结果先收起；需要时点「识别本页」', '');
+  }
+
   async function afterContentChange(opts = {}) {
     const { pageImage = true } = opts;
+    dropStaleOcr();
     reloadThumb(S.page);
     if (pageImage) reloadPageImage(S.page);
     requestAnimationFrame(renderDocList);
@@ -1433,8 +1446,10 @@
       paint('both');
       try {
         await api('/api/ink', { json: { page: S.page, strokes: [{ points: d.points, color: d.color, width: d.width }] } });
+        dropStaleOcr();
         const objs = await api(`/api/page/${S.page}/objects?ocr=0`);
         S.objs.strokes = objs.strokes.items;
+        if ((S.objs.texts || []).some((t) => t.source === 'ocr')) S.objs.texts = objs.texts.items;
         paint('both');
         renderObjList();
         reloadThumb(S.page);

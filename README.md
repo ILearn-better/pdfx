@@ -61,6 +61,10 @@ d.update_text(1, "p1:t56,300", "新内容")   # 结构化页
 > 连续模式滚下去一路卡。现在浏览只读文本层，扫描页显示为"未识别"；
 > 需要文字时点右侧对象面板的「识别本页」，或直接检索/导出全文（这两个动作会自动识别）。
 > 识别结果按「页面图像指纹」缓存，同一页只算一次。
+>
+> 识别过又改了内容（插字、画笔、拖图）时，旧识别框和画面已经对不上，
+> 界面会**自动收起这一页的 OCR 结果**并提示一句 —— 继续拿旧框去框字，
+> 就会出现"框在这里、字在那里"。要看新内容的文字，再点一次「识别本页」即可。
 
 ---
 
@@ -220,7 +224,7 @@ with PDFDocument("报告.pdf") as d:
 | 对象 | 操作范围 | 交互 |
 |---|---|---|
 | **文本** | 改内容、字号、颜色、字体、对齐。**结构化页保留原样式**（字号/颜色/字体族自动继承）；扫描页自动取区域底色做覆盖。<br>新内容变长时向右扩框（不越出右边距），避免被压成多行 | UI：选中文字 → 属性面板改内容 → 「应用修改」<br>CLI：`text update --id .. --text ".." [--size 12 --color "#c00"]`<br>API：`PUT /api/text` |
-| **文本的位置/大小** | **移动**（不改内容）或**缩放**（按框高比例联动字号）。原位置会被真正抹除，不留残影；两类 PDF 都适用 | UI：选中后拖动 = 移动，拖四角 = 等比缩放，拖四边 = 改宽度自动换行<br>API：`PUT /api/text` 传 `{page, id, rect, font_size?}`<br>Python：`doc.transform_text(page, id, rect=[x0,y0,x1,y1])` |
+| **文本的位置/大小** | **移动**（不改内容）或**缩放**（字号跟着框走）。<br>**目标框是硬边界**：字号放不下就在框内缩小，绝不会把字画到框外（早先是把绘制框往下撑 1.8 倍，字直接压到下面的正文上）。<br>只拖左右边 = 纯重排，字号不变、框往下长。<br>多行文本框在文本层里是一行一条，会按内容合并成**一个**对象，拖动/删除都是整体。<br>原位置会被真正抹除，不留残影；两类 PDF 都适用 | UI：选中后拖动 = 移动，拖四角 = 等比缩放，拖四边 = 改宽度自动换行<br>API：`PUT /api/text` 传 `{page, id, rect, font_size?}`（返回里 `fitted=false` 表示框小到 4pt 都放不下）<br>Python：`doc.transform_text(page, id, rect=[x0,y0,x1,y1])` |
 | **图片** | 「替换内容」（保持位置）、「移动/缩放」（保持内容）、「单向拉伸」三件事。<br>移动/缩放会先盖掉原位置再在新位置重绘，等比由 `keep_ratio` 控制 | UI：选中图片 → 「替换图片」；拖动 = 移动，拖四角等比、拖四边拉伸<br>CLI：`image replace --id .. --src new.png`<br>API：`PUT /api/image` 传 `{page, id, rect, keep_ratio?}`<br>Python：`doc.transform_image(page, id, rect, keep_ratio=False)` |
 
 ### 3.5 查：全文检索与导出
@@ -311,9 +315,9 @@ python tools/install_skill.py
 
 ```bash
 python tools/make_samples.py     # 生成三类样本（结构化 / 扫描 / 混合）
-python tools/selftest.py         # 端到端 68 项，纯 Python API
-python tools/api_smoke.py        # HTTP 31 项，自动起停独立服务
-node   tools/uitest.mjs          # 界面 75 项，真实浏览器点击/拖拽/触摸（需 node 18+ 与 Edge/Chrome）
+python tools/selftest.py         # 端到端 75 项，纯 Python API
+python tools/api_smoke.py        # HTTP 33 项，自动起停独立服务
+node   tools/uitest.mjs          # 界面 79 项，真实浏览器点击/拖拽/触摸（需 node 18+ 与 Edge/Chrome）
 python tools/bench.py            # 性能基准（不是断言，用来看数字有没有退化）
 ```
 

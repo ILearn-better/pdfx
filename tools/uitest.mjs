@@ -477,14 +477,22 @@ async function main() {
     await new Promise(z => setTimeout(z, 1800));
     const t3 = await grab();
     if (!t3) return { err: '缩放后文本丢失' };
+    // 松手的位置就是用户给的目标框；字必须还在里面
+    const want = [t2.bbox[0], t2.bbox[1], t2.bbox[2] + 72 / k, t2.bbox[3] + 48 / k];
+    const over = Math.max(t3.bbox[2] - want[2], t3.bbox[3] - want[3]);
     return {
       moved: [Math.round(t1.bbox[0] - t0.bbox[0]), Math.round(t1.bbox[1] - t0.bbox[1])],
       before, after: [Math.round(t3.bbox[2] - t3.bbox[0]), Math.round(t3.bbox[3] - t3.bbox[1])],
+      over: Math.round(over * 10) / 10, size0: t2.size, size3: t3.size,
     };
   })()`);
   check('文本框可以拖动移动', tmove.moved && Math.abs(tmove.moved[0]) > 10, tmove.err || JSON.stringify(tmove.moved));
   check('文本框可以拖角缩放', tmove.after && tmove.after[0] > tmove.before[0] + 5,
     tmove.err || `${JSON.stringify(tmove.before)} → ${JSON.stringify(tmove.after)}`);
+  check('拖角放大后文字没有被挤出文本框', tmove.over != null && tmove.over <= 1.5,
+    tmove.err || `超出 ${tmove.over}pt`);
+  check('拖角放大后字号跟着变大', tmove.size3 > tmove.size0 + 1,
+    tmove.err || `${tmove.size0}pt → ${tmove.size3}pt`);
 
   // ---- 图片：点工具就直接插入，不再要求先拖框 ----
   console.log('\n== 图片：直接插入 / 缩放 ==');
@@ -1118,6 +1126,27 @@ async function main() {
   check('点「识别本页」之后文字才出现', ocrAfter.ocrTag > 0,
     `${ocrAfter.ocrTag} 行 OCR｜${ocrAfter.toast}`);
   await shot('ocr-manual');
+
+  // 识别之后再改内容：旧识别框和画面已经对不上，应当自动收起（而不是继续拿旧框框字）
+  const ocrStale = await ev(`(async () => {
+    const mk = (t, x, y, b, pid) => new PointerEvent(t, { clientX: x, clientY: y, bubbles: true, cancelable: true, pointerId: pid, pointerType: 'mouse', isPrimary: true, button: 0, buttons: b });
+    document.querySelector('[data-tool="draw"]').click();
+    const im = document.querySelector('#pages .pbox.current img');
+    const r = im.getBoundingClientRect();
+    im.dispatchEvent(mk('pointerdown', r.left + 300, r.top + 700, 1, 91));
+    for (let i = 1; i <= 5; i++) im.dispatchEvent(mk('pointermove', r.left + 300 + i * 8, r.top + 700, 1, 91));
+    im.dispatchEvent(mk('pointerup', r.left + 340, r.top + 700, 0, 91));
+    await new Promise((z) => setTimeout(z, 2200));
+    return {
+      ocrTag: document.querySelectorAll('#objlist .tag.ocr').length,
+      strokes: document.querySelectorAll('#objlist .obj').length,
+      btn: (document.querySelector('#btn-ocr') || {}).textContent,
+      toast: (document.querySelector('#toast') || {}).textContent,
+    };
+  })()`);
+  check('改完页面内容后旧 OCR 结果自动收起', ocrStale.ocrTag === 0,
+    `OCR 行 ${ocrStale.ocrTag}｜${ocrStale.toast}`);
+  check('收起后按钮回到「识别本页」', /识别本页/.test(String(ocrStale.btn)), String(ocrStale.btn));
 
   console.log(`\n合计 ${pass} 项通过，${fail} 项失败`);
   if (errors.length) {

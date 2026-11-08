@@ -123,6 +123,48 @@ def main() -> int:
     ok("缩放文本（字号联动）", big["font_size"] > tf["font_size"], f"{tf['font_size']:.1f} → {big['font_size']:.1f}pt")
     ok("缩放后原位置无残留", d.search("已加密")["total"] >= 1, "文字仍可检索")
 
+    # 放大文本框：字必须还留在框里。以前 insert_textbox 放不下就把绘制框往下
+    # 撑到 1.8 倍，字直接压到下面的正文上 —— 用起来就是"字体脱离了文本框"。
+    def user_texts():
+        return [x for x in d.list_text(0)["items"] if x["source"] == "user"]
+
+    # 单独放一个框在左侧空地：放大后不能顶到页边（顶到就没法验证"按比例"）
+    bx = d.add_text(0, "放大后文字留在框内\n第二行文字要更长一些", rect=[56, 430, 256, 472], font_size=12)
+    b0 = bx["bbox"]
+    big_box = [
+        b0[0], b0[1],
+        b0[0] + (b0[2] - b0[0]) * 1.8,
+        b0[1] + (b0[3] - b0[1]) * 1.8,
+    ]
+    up = d.transform_text(0, bx["id"], rect=big_box, font_size=12 * 1.8)
+    ok("放大后文字不超出文本框", up["bbox"][2] <= big_box[2] + 1.5 and up["bbox"][3] <= big_box[3] + 1.5,
+       f"bbox={[round(v, 1) for v in up['bbox']]} 框={[round(v, 1) for v in big_box]}")
+    ok("放大后字号跟着框走", abs(up["font_size"] - 12 * 1.8) < 0.6, f"12.0 → {up['font_size']:.1f}pt")
+
+    # 连续缩放不能越拖越小（排版框比字形范围高，每次都重排会把字号一点点挤掉）
+    b1 = up["bbox"]
+    half = [
+        b1[0], b1[1],
+        b1[0] + (b1[2] - b1[0]) / 1.8,
+        b1[1] + (b1[3] - b1[1]) / 1.8,
+    ]
+    down = d.transform_text(0, bx["id"], rect=half, font_size=up["font_size"] / 1.8)
+    ok("放大再缩小，字号不漂移", abs(down["font_size"] - 12) < 0.8,
+       f"12.00 → 放大 {up['font_size']:.2f} → 缩回 {down['font_size']:.2f}")
+    ok("多行文本框仍是一个对象", len([x for x in user_texts() if x["id"] == bx["id"]]) == 1,
+       f"{len([x for x in user_texts() if x['id'] == bx['id']])} 条")
+    d.delete_text(0, bx["id"])
+
+    # 多行文本框在文本层里会被拆成多行，必须合成一个对象，
+    # 否则拖框只带走第一行、删也只删一行
+    mt = d.add_text(0, "第一行\n第二行更长一点", rect=[100, 700, 320, 745], font_size=12)
+    objs = [x for x in d.list_text(0)["items"] if x["id"] == mt["id"]]
+    ok("多行文本框只算一个对象", len(objs) == 1 and "第二行" in objs[0]["text"],
+       f"命中 {len(objs)} 条")
+    ok("多行文本框可整体拖动", d.transform_text(0, mt["id"], rect=[120, 720, 340, 765])["bbox"][0] > 110)
+    d.delete_text(0, mt["id"])
+    ok("多行文本框可整体删除", d.search("第二行更长")["total"] == 0)
+
     ts2 = d.transform_image(0, tr["id"], [300, 600, 420, 700], keep_ratio=False)
     ok("拉伸图片（单向）", abs((ts2["bbox"][2] - ts2["bbox"][0]) - 120) < 6, f"bbox={ts2['bbox']}")
 
@@ -133,8 +175,8 @@ def main() -> int:
     d.delete_image(0, tr["id"])
     ok("删除图片", d.list_images(0)["count"] == 1)
 
-    # 文本已被移动/缩放过，坐标 id 会变，这里按位置定位
-    d.delete_text(0, {"bbox": big["bbox"]})
+    # 文本已被移动/缩放过，坐标 id 会变，这里按内容定位
+    d.delete_text(0, {"bbox": user_texts()[0]["bbox"]})
     ok("删除文本", d.search("已加密")["total"] == 0)
 
     n0 = d.page_count

@@ -94,6 +94,15 @@ def _font_for(text: str, hint: str = "") -> str:
     return "helv"
 
 
+def _squash(text: str) -> str:
+    """去掉所有空白，用来比对"这是不是同一段文字"。
+
+    换行、缩进、CJK 之间的空格在文本层提取时并不可靠，
+    直接比字符串会把同一段内容判成不同。
+    """
+    return re.sub(r"\s+", "", text or "")
+
+
 def _norm_with_map(text: str) -> tuple[str, list[int]]:
     chars: list[str] = []
     idx: list[int] = []
@@ -285,60 +294,88 @@ class TextMixin:
         return _merge_fragments(out)
 
     def _merge_user_texts(self, page_no: int, lines: list[dict]) -> list[dict]:
-        """把内容流里的用户文本识别出来，换成可精确操作的 state id。"""
+        """把内容流里的用户文本识别出来，换成可精确操作的 state id。
+
+        **按内容认领，不按就近认领**。insert_textbox 插入的多行文字在文本层里
+        是一行一条，只比坐标会把记录绑到旁边不相干的一行上 —— 于是拖这个框，
+        被抹掉的却是别人的字（表现为"文字越拖越乱、框放大后字跑出去"）。
+        这里改成：取落在记录框里的原生行，按阅读顺序拼起来，内容与记录一致
+        才认领；认领后把这几行合成**一个**对象（同一个 id、同一个框）。
+        """
         st = self._pstate_by_index(page_no)
         recs = st.get("texts", [])
         if not recs:
             return lines
+
         claimed: set[int] = set()
+        drop: set[int] = set()
         for rec in recs:
             rb = rec.get("bbox")
             if not rb:
                 continue
-            best, best_i = None, -1
-            best_score = 0.0
+            want = _squash(rec.get("text", ""))
+            idxs: list[int] = []
             for i, ln in enumerate(lines):
-                if ln["source"] != "text" or i in claimed:
+                if ln.get("source") != "text" or i in claimed:
                     continue
-                # 起点吻合优先（insert_textbox 的框往往比实际文字大）
-                dx = abs(ln["bbox"][0] - rb[0])
-                dy = abs(ln["bbox"][1] - rb[1])
-                inside = (
-                    rb[0] - 3 <= ln["bbox"][0] and rb[1] - 3 <= ln["bbox"][1]
-                    and ln["bbox"][2] <= rb[2] + 3 and ln["bbox"][3] <= rb[3] + 3
-                )
-                score = 0.0
-                if dx <= 3.5 and dy <= 5:
-                    score = 1.0
-                elif inside:
-                    score = 0.8
-                else:
-                    score = iou(rb, ln["bbox"])
-                if score > best_score:
-                    best, best_i, best_score = ln, i, score
-            if best is not None and best_score >= 0.5:
-                claimed.add(best_i)
-                best["source"] = "user"
-                best["id"] = rec["id"]
-                best["user_record"] = True
-                # 用实际文字范围回填，后续定位更准
-                if rect_area(best["bbox"]) < rect_area(rb):
-                    rec["bbox"] = list(best["bbox"])
-            elif best_score < 0.5:
-                lines.append(
+                x0, y0, x1, y1 = ln["bbox"]
+                cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+                if (rb[0] - 4 <= x0 and x1 <= rb[2] + 4 and rb[1] - 4 <= cy <= rb[3] + 4) \
+                        or (rb[0] - 4 <= cx <= rb[2] + 4 and rb[1] - 4 <= cy <= rb[3] + 4):
+                    idxs.append(i)
+            idxs.sort(key=lambda i: (round(lines[i]["bbox"][1] / 3.0), lines[i]["bbox"][0]))
+
+            group: list[int] = []
+            got = ""
+            for i in idxs:
+                group.append(i)
+                got += _squash(lines[i]["text"])
+                if len(got) >= len(want):
+                    break
+
+            if group and want and got == want:
+                claimed.update(group)
+                first = lines[group[0]]
+                union = fitz.Rect(first["bbox"])
+                for i in group[1:]:
+                    union |= fitz.Rect(lines[i]["bbox"])
+                    drop.add(i)
+                first.update(
                     {
                         "id": rec["id"],
-                        "page": page_no,
-                        "bbox": list(rb),
-                        "text": rec.get("text", ""),
                         "source": "user",
-                        "size": rec.get("font_size", 11),
-                        "font": rec.get("font", ""),
-                        "color": rec.get("color", [0, 0, 0]),
                         "user_record": True,
-                        "detached": True,
+                        "bbox": _rect_list(union),
+                        "text": rec.get("text", ""),
+                        "size": float(rec.get("font_size") or first.get("size") or 11),
+                        "color": rec.get("color") or first.get("color"),
+                        "font": rec.get("font") or first.get("font", ""),
                     }
                 )
+                # 用实际文字范围回填，后续定位更准
+                if rect_area(_rect_list(union)) < rect_area(rb):
+                    rec["bbox"] = _rect_list(union)
+                continue
+
+            # 内容对不上（字形没编码、文字已被涂掉等）：按记录自己的框挂一个对象。
+            # 绝不能借用别人的 id —— 那样拖动会删掉别人的内容。
+            lines.append(
+                {
+                    "id": rec["id"],
+                    "page": page_no,
+                    "bbox": list(rb),
+                    "text": rec.get("text", ""),
+                    "source": "user",
+                    "size": float(rec.get("font_size") or 11),
+                    "font": rec.get("font", ""),
+                    "color": rec.get("color", [0, 0, 0]),
+                    "user_record": True,
+                    "detached": True,
+                }
+            )
+
+        if drop:
+            lines = [ln for i, ln in enumerate(lines) if i not in drop]
         return lines
 
     def _image_coverage(self, page: fitz.Page) -> float:
@@ -417,6 +454,9 @@ class TextMixin:
                 force_ocr = ":o" in target
         lines = self._page_lines(page_no, force_ocr=force_ocr, dpi=dpi)
         if isinstance(target, dict):
+            # 只给 id 也要能用（界面拖动时传的就是 {page, id, rect}）
+            if target.get("id") and not target.get("bbox"):
+                return self._find_text(page_no, str(target["id"]), force_ocr=force_ocr, dpi=dpi)
             bbox = norm_rect(target.get("bbox") or [])
             if not bbox or len(bbox) != 4:
                 raise PdfxError("target 缺少 bbox", "bad_target")
@@ -435,7 +475,7 @@ class TextMixin:
                         "bbox": rec["bbox"],
                         "text": rec.get("text", ""),
                         "source": "user",
-                        "size": rec.get("size", 11),
+                        "size": float(rec.get("font_size") or rec.get("size") or 11),
                         "color": rec.get("color", [0, 0, 0]),
                         "font": rec.get("font", ""),
                     }
@@ -591,22 +631,95 @@ class TextMixin:
             page.insert_text((r.x0, r.y0 + font_size), text, fontname=fn, fontsize=font_size, color=col)
         return _rect_list(box)
 
+    def _draw_text_fit(
+        self,
+        page: fitz.Page,
+        rect: Sequence[float],
+        text: str,
+        font_size: float,
+        color: Any = None,
+        font: str | None = None,
+        align: int = 0,
+        line_height: float | None = None,
+        min_size: float = 4.0,
+    ) -> tuple[list[float], float, bool, list[float]]:
+        """把文字画进 rect，**装不下就缩字号，绝不让字跑到框外**。
+
+        这是"放大文本框"的正确行为：插入/改内容时框可以跟着字长，
+        但拖动缩放手柄时框是用户给定的边界，字只能在这个边界内重排。
+
+        insert_textbox 放不下时不会写入任何内容（返回负数 = 还差多少高度），
+        所以可以原地按比例反复试，不需要在临时页上测量。
+        返回 (目标框, 实际字号, 是否成功, 文字实际占用的排版框)。
+        """
+        r = fitz.Rect(*norm_rect(rect))
+        if r.width < 6:
+            r.x1 = r.x0 + 6
+        outer = fitz.Rect(r)
+        pr = page.rect
+        # 一点点余量：tight bbox 只量到字形，而 insert_textbox 还要算行距，
+        # 不留余量的话"等比放大"会莫名其妙地缩掉 10%。返回值仍按 outer 报，
+        # 真实的字形范围由 _bbox_of_text 回填。
+        pad = min(3.0, max(1.0, r.height * 0.02))
+        r = fitz.Rect(min(r.x0, pr.x1), min(r.y0, pr.y1),
+                      min(r.x1 + pad, pr.x1), min(r.y1 + pad, pr.y1))
+
+        fn = font or _font_for(text)
+        col = _as_rgb(color)
+        kwargs: dict[str, Any] = {
+            "fontname": fn,
+            "color": col,
+            "align": int(align),
+            "overlay": True,
+        }
+        if line_height:
+            kwargs["lineheight"] = float(line_height)
+
+        size = max(min_size, float(font_size))
+        for _ in range(12):
+            rc = page.insert_textbox(r, text, fontsize=size, **kwargs)
+            if rc >= 0:
+                # 剩下的高度 = 没用到的高度，反推文字真正占的排版高度。
+                # 拿它当排版框存下来，下次按比例缩放时就不会累积误差
+                # （累积的话拖几次字号就被"塞"小了）。
+                fitbox = [r.x0, r.y0, r.x1, round(r.y1 - rc, 2)]
+                return _rect_list(outer), size, True, fitbox
+            # rc 负值 = 还差多少高度；按"现有高度 / 需要高度"反推字号
+            need = abs(rc)
+            nxt = size * (r.height / max(r.height + need, 1e-6))
+            if nxt >= size - 0.05:
+                nxt = size * 0.94           # 保证单调下降，避免卡住
+            size = max(min_size, nxt)
+            if size <= min_size + 1e-6:
+                break
+        rc = page.insert_textbox(r, text, fontsize=min_size, **kwargs)
+        fitbox = [r.x0, r.y0, r.x1, round(r.y1 - rc, 2)] if rc >= 0 else _rect_list(r)
+        return _rect_list(outer), min_size, rc >= 0, fitbox
+
     def _bbox_of_text(self, page_no: int, box: Sequence[float], text: str) -> list[float] | None:
-        """回溯刚绘制文本的真实包围盒（insert_textbox 只返回"剩余空间"）。"""
+        """回溯刚绘制文本的真实包围盒（insert_textbox 只返回"剩余空间"）。
+
+        只统计内容属于 `text` 的行 —— 文本框往往压在正文上，不筛内容的话
+        框里原有的字会把包围盒撑大，判据就失效了（画笔框位置会歪）。
+        """
         try:
             p = self.page(page_no)
             clip = fitz.Rect(*norm_rect(box)) + (-1, -1, 1, 1)
             data = p.get_text("dict", clip=clip)
         except Exception:
             return None
+        want = _squash(text)
         boxes = []
         for block in data.get("blocks", []):
             if block.get("type") != 0:
                 continue
             for line in block.get("lines", []):
                 t = "".join(s.get("text", "") for s in line.get("spans") or [])
-                if t.strip():
-                    boxes.append(fitz.Rect(line["bbox"]))
+                if not t.strip():
+                    continue
+                if want and _squash(t) not in want:
+                    continue
+                boxes.append(fitz.Rect(line["bbox"]))
         if not boxes:
             return None
         union = boxes[0]
@@ -675,7 +788,7 @@ class TextMixin:
         self._push_undo()
         if background is not None:
             page.draw_rect(fitz.Rect(*box), color=None, fill=_as_rgb(background), overlay=True)
-        used = self._draw_text(
+        drawn = self._draw_text(
             page,
             box,
             text,
@@ -686,12 +799,16 @@ class TextMixin:
             line_height=line_height,
             background=None,
         )
-        tight = self._bbox_of_text(page_no, used, text)
+        used = drawn
+        tight = self._bbox_of_text(page_no, drawn, text)
         if tight:
             used = tight
         rec = {
             "id": f"p{page_no}:ut{_short()}",
             "bbox": used,
+            # 排版框：文字按这个框换行。它比字形范围（bbox）略大，
+            # 拖动时按同样比例缩放，字号才不会每次都被"重新塞一遍"而缩水。
+            "box": list(_rect_list(fitz.Rect(*norm_rect(drawn)))),
             "text": text,
             "font_size": float(font_size),
             "color": list(_as_rgb(color)),
@@ -753,7 +870,7 @@ class TextMixin:
             if need > have * 1.02:
                 limit = page.rect.width - box[0] - 10
                 box[2] = box[0] + max(have, min(need, max(limit, have)))
-        used = self._draw_text(
+        drawn = self._draw_text(
             page,
             box,
             text,
@@ -763,22 +880,27 @@ class TextMixin:
             align=style["align"],
             line_height=style["line_height"],
         )
-        tight = self._bbox_of_text(page_no, used, text)
+        used = drawn
+        tight = self._bbox_of_text(page_no, drawn, text)
         if tight:
             used = tight
 
         st = self._pstate(page)
         for rec in st.get("texts", []):
             if rec["id"] == item.get("id"):
-                rec.update({"text": text, "bbox": used, "font_size": style["font_size"],
+                rec.update({"text": text, "bbox": used, "box": list(_rect_list(fitz.Rect(*norm_rect(drawn)))),
+                            "font_size": style["font_size"],
                             "color": list(_as_rgb(style["color"])), "font": style["font"]})
                 break
         else:
-            if item.get("source") == "user" or item.get("user_record"):
+            if item.get("source") in ("user", "ocr") or item.get("user_record"):
+                # OCR 行的 id 是按坐标编号的，改完位置就失效，换一个新的 ut id
+                keep_id = item.get("source") != "ocr" and item.get("id")
                 st.setdefault("texts", []).append(
                     {
-                        "id": item.get("id") or f"p{page_no}:ut{_short()}",
+                        "id": keep_id or f"p{page_no}:ut{_short()}",
                         "bbox": used,
+                        "box": list(_rect_list(fitz.Rect(*norm_rect(drawn)))),
                         "text": text,
                         "font_size": style["font_size"],
                         "color": list(_as_rgb(style["color"])),
@@ -800,6 +922,8 @@ class TextMixin:
         """移动 / 缩放一段文本：抹掉原位置，在目标框内按新字号重排。
 
         拖角 = 等比缩放（按高度比例联动字号）；拖边 = 只改框宽，字号不变（自动换行）。
+        **目标框是硬边界**：字号放不下就在框内缩小，不会像以前那样把绘制框
+        往下撑开 —— 那样字会跑到框外面去，看上去就是"字体脱离了文本框"。
         两类 PDF 走同一入口，底层仍按 source 分派：结构化页用 redaction 真删，
         扫描页用底色块贴补。修改后原位置不会留下残影。
         """
@@ -816,7 +940,16 @@ class TextMixin:
         if new[2] - new[0] < 4 or new[3] - new[1] < 4:
             raise PdfxError("目标框太小，至少 4pt", "bad_target")
 
-        base_size = float(item.get("size") or 11)
+        page = self.page(page_no)
+        pr = page.rect
+        new = [
+            min(max(new[0], 0.0), pr.width - 4),
+            min(max(new[1], 0.0), pr.height - 4),
+            min(max(new[2], new[0] + 4), pr.width),
+            min(max(new[3], new[1] + 4), pr.height),
+        ]
+
+        base_size = float(item.get("font_size") or item.get("size") or 11)
         if font_size is not None:
             size = float(font_size)
         else:
@@ -825,7 +958,29 @@ class TextMixin:
             size = base_size * ratio if 0.25 < ratio < 4 else base_size
         size = max(4.0, min(300.0, size))
 
-        page = self.page(page_no)
+        st = self._pstate_by_index(page_no)
+        rec = next((r for r in st.get("texts", []) if r.get("id") == item.get("id")), None)
+        # 目标框是"字形范围"缩放来的，而排版框（box）比它高一点。
+        # 这里宽度直接用用户拖出来的宽度（换行按这个宽度重排），高度沿用
+        # 原来的排版余量再按比例缩放 —— 否则 tight bbox 比排版框矮，
+        # 每次等比放大都会被重新"塞"一遍，字号一点点掉下去。
+        draw = list(new)
+        old_box = list((rec or {}).get("box") or [])
+        sx = sy = 1.0
+        if old[2] > old[0] and old[3] > old[1]:
+            sx = (new[2] - new[0]) / (old[2] - old[0])
+            sy = (new[3] - new[1]) / (old[3] - old[1])
+        if len(old_box) != 4:
+            # 没有记录（原生文字 / OCR 行）时按行距估一个排版框：
+            # insert_textbox 对一行 CJK 要 1.57×字号的高度（行距 + 上下留白），
+            # 而字形范围只有 0.87 左右 —— 直接拿 bbox 当框，等比放大必被挤小。
+            box_h = max((old[3] - old[1]) * 1.08, base_size * 1.6)
+            old_box = [new[0], new[1], new[2], new[1] + box_h]
+        if 0.1 < sy < 10:
+            draw[3] = min(pr.height, new[1] + (old_box[3] - old_box[1]) * sy)
+        # 只拖左右边（高度没变）= 纯重排：字号保持不变，框放不下就往下长。
+        # 这是编辑器里"改宽度"的正常手感，不该把字号缩掉。
+        reflow = abs(sy - 1.0) < 0.03 and abs(sx - 1.0) > 0.03
         src = item.get("source")
         self._push_undo()
         if src == "ocr":
@@ -836,20 +991,51 @@ class TextMixin:
             self._redact(page, [old])
             ink = color if color is not None else (item.get("color") or [0, 0, 0])
 
-        used = self._draw_text(
-            page, new, text, font_size=size, color=ink, font=_font_for(text, item.get("font", "")), align=0
-        )
-        tight = self._bbox_of_text(page_no, used, text)
+        if reflow:
+            drawn = self._draw_text(
+                page, draw, text, font_size=size, color=ink, font=_font_for(text, item.get("font", "")), align=0
+            )
+            fitted = True
+        else:
+            outer, size, fitted, fitbox = self._draw_text_fit(
+                page, draw, text, size, color=ink, font=_font_for(text, item.get("font", "")), align=0
+            )
+            drawn = fitbox if fitted else outer
+        used = drawn
+        if not fitted:
+            # 极端情况：框小到 4pt 都放不下。允许外扩，至少要保证内容完整、不丢字。
+            used = drawn = self._draw_text(
+                page, draw, text, font_size=size, color=ink, font=_font_for(text, item.get("font", "")), align=0
+            )
+        tight = self._bbox_of_text(page_no, drawn, text)
         if tight:
             used = tight
 
-        st = self._pstate(page)
-        for rec in st.get("texts", []):
-            if rec.get("id") == item.get("id"):
-                rec.update({"bbox": used, "font_size": size, "color": list(_as_rgb(ink))})
+        for r in st.get("texts", []):
+            if r.get("id") == item.get("id"):
+                r.update({"bbox": used, "box": list(_rect_list(fitz.Rect(*norm_rect(drawn)))),
+                          "font_size": size, "color": list(_as_rgb(ink))})
                 break
+        else:
+            # 扫描件上的 OCR 文字没有 state 记录，改完之后就只剩"内容流里的几行字"：
+            # 下次再拖它，排版框和字号都无从继承（会一点点被塞小），id 也会随坐标变。
+            # 这里补一条记录，让它从此和用户插入的文本框一样可反复操作。
+            if src == "ocr":
+                st.setdefault("texts", []).append(
+                    {
+                        "id": f"p{page_no}:ut{_short()}",
+                        "bbox": used,
+                        "box": list(_rect_list(fitz.Rect(*norm_rect(drawn)))),
+                        "text": text,
+                        "font_size": size,
+                        "color": list(_as_rgb(ink)),
+                        "font": _font_for(text, item.get("font", "")),
+                        "created": time.time(),
+                    }
+                )
         self._touch()
-        return {"page": page_no, "bbox": used, "font_size": size, "source": src}
+        return {"page": page_no, "bbox": used, "font_size": size, "source": src,
+                "fitted": bool(fitted)}
 
     # ---------------------------------------------------------------- 删
     def delete_text(self, page_no: int, targets: Any, background: Any = None) -> dict[str, Any]:

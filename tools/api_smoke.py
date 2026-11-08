@@ -150,6 +150,17 @@ def main() -> int:
     added = call("/api/text", {"page": 0, "text": "API 插入测试", "rect": [330, 620, 520, 660], "font_size": 14})["data"]
     ok_all &= check("POST /api/text", added.get("id", "").startswith("p0:ut"), added.get("id", ""))
 
+    # 界面上拖角放大走的就是 PUT + rect：字必须留在框内，字号跟着框走
+    bb = added["bbox"]
+    box = [bb[0], bb[1], bb[0] + (bb[2] - bb[0]) * 1.6, bb[1] + (bb[3] - bb[1]) * 1.6]
+    rz = call("/api/text", {"page": 0, "id": added["id"], "rect": box, "font_size": 14 * 1.6},
+              method="PUT")["data"]
+    ok_all &= check("PUT /api/text 放大后不越框",
+                    rz["bbox"][2] <= box[2] + 1.5 and rz["bbox"][3] <= box[3] + 1.5,
+                    f"bbox={[round(v, 1) for v in rz['bbox']]} 框={[round(v, 1) for v in box]}")
+    ok_all &= check("PUT /api/text 放大后字号联动", abs(rz["font_size"] - 14 * 1.6) < 0.6,
+                    f"14.0 → {rz['font_size']:.1f}pt")
+
     ink = call("/api/ink", {"page": 0, "strokes": [{"points": [[60, 700], [140, 720], [220, 690]], "color": "#1a73e8", "width": 3}]})["data"]
     ok_all &= check("POST /api/ink", ink["added"] == 1)
 
