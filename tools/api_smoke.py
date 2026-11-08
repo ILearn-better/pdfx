@@ -156,10 +156,22 @@ def main() -> int:
     era = call("/api/ink/erase", {"page": 0, "points": [[140, 715]], "radius": 12})["data"]
     ok_all &= check("POST /api/ink/erase", era["removed"] >= 1, str(era))
 
-    # 页面级橡皮：擦的是页面原有内容，不只是自己画的笔迹
-    er2 = call("/api/erase", {"page": 0, "points": [[120, 300], [260, 300]], "radius": 14})["data"]
-    ok_all &= check("POST /api/erase（擦页面内容）",
-                    er2["covered"] >= 1, f"covered={er2['covered']} 文字={er2['removed_text_count']} 笔迹={er2['strokes_removed']}")
+    # 橡皮接口默认只切笔迹。擦页面原有内容是不可逆的破坏性操作，
+    # 必须显式 allow_content=True 才放行 —— 老前端没刷新页面也伤不到正文。
+    t_before = call("/api/page/0/objects?ocr=0")["data"]["texts"]["count"]
+    call("/api/ink", {"page": 0, "strokes": [
+        {"points": [[120, 300], [190, 302], [260, 300]], "color": "#d64545", "width": 3}]})
+    guard = call("/api/erase", {"page": 0, "points": [[120, 300], [260, 300]], "radius": 10})["data"]
+    ok_all &= check("POST /api/erase 默认只擦笔迹",
+                    guard.get("removed", 0) >= 1 and "covered" not in guard, str(guard))
+    t_after = call("/api/page/0/objects?ocr=0")["data"]["texts"]["count"]
+    ok_all &= check("默认擦除不碰正文", t_after == t_before, f"{t_before} → {t_after}")
+
+    # 显式允许后才擦页面内容（CLI / AI 用这条路）
+    er2 = call("/api/erase", {"page": 0, "points": [[120, 300], [260, 300]], "radius": 14,
+                              "allow_content": True})["data"]
+    ok_all &= check("allow_content 显式开启才擦页面内容",
+                    er2["covered"] >= 1, f"covered={er2['covered']} 文字={er2['removed_text_count']}")
 
     # ---- 图片：插入 → 删除 → 同一位置再插入 ----
     # 界面点「删除」不会传 mode。接口默认值必须是真删（purge），

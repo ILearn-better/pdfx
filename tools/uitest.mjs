@@ -820,17 +820,27 @@ async function main() {
   })()`);
   check('接口能把别的 PDF 插入当前文档', imp.ok === true, JSON.stringify(imp));
 
-  // ---- 橡皮：擦掉页面原有内容（扫描件/文字页，而不只是自己画的笔迹）----
-  console.log('\n== 橡皮：擦掉页面原有内容 ==');
+  // ---- 橡皮：只擦笔迹，绝不碰页面原有内容 ----
+  // 曾经提供过「笔迹 + 页面内容」的选项，结果在正式文档上误扫一遍就把正文
+  // 真删了（redaction 不可逆）。现在界面只擦自己画的笔迹，这条用"深色像素数
+  // 与文字条数都不变"来钉死。
+  console.log('\n== 橡皮：只擦笔迹 ==');
   const contentErase = await ev(`(async () => {
     const mk = (t, x, y, b, pid) => new PointerEvent(t, { clientX: x, clientY: y, bubbles: true, cancelable: true, pointerId: pid, pointerType: 'mouse', isPrimary: true, button: 0, buttons: b });
-    // 切到有内容的文档（sample_mixed）
+    // 切到有正文的文档（sample_mixed）
     const items = [...document.querySelectorAll('#doclist .docitem')];
     const target = items.find((el) => /sample_mixed/.test(el.textContent));
     if (!target) return { err: '找不到 sample_mixed 文档' };
     target.click();
     await new Promise((z) => setTimeout(z, 1800));
-    const img = () => document.querySelector('#pages .pbox.current img');
+    const box = () => document.querySelector('#pages .pbox.current');
+    const img = () => box().querySelector('img');
+    const pageNo = +box().dataset.page;
+    const doc = (await (await fetch('/api/docs')).json()).data.current;
+    const cnt = async () => {
+      const j = (await (await fetch('/api/page/' + pageNo + '/objects?ocr=0&doc=' + doc)).json()).data;
+      return { texts: j.texts.count, strokes: j.strokes.count };
+    };
     const dark = async () => {
       const im = img();
       if (!im.complete) await new Promise((z) => { im.onload = z; setTimeout(z, 800); });
@@ -843,33 +853,55 @@ async function main() {
       for (let i = 0; i < d.length; i += 4) if (d[i] < 170) n++;
       return n;
     };
-    const before = await dark();
-    const beforeSrc = img().src;
+    const before = await cnt();
+    const darkBefore = await dark();
+    const r = img().getBoundingClientRect();
+    let pid = 90;
+
+    // 1) 自己画一笔，横穿页面中部
+    document.querySelector('[data-tool="draw"]').click();
+    await new Promise((z) => setTimeout(z, 200));
+    const y0 = r.top + r.height * 0.45;
+    img().dispatchEvent(mk('pointerdown', r.left + 40, y0, 1, ++pid));
+    for (let i = 1; i <= 30; i++) img().dispatchEvent(mk('pointermove', r.left + 40 + i * 10, y0, 1, pid));
+    img().dispatchEvent(mk('pointerup', r.left + 360, y0, 0, pid));
+    await new Promise((z) => setTimeout(z, 1200));
+    const drawn = await cnt();
+    const objText = (document.querySelector('#objlist') || {}).innerText || '';
+
+    // 2) 橡皮扫过同一处，并额外扫过顶部几行正文
     document.querySelector('[data-tool="erase"]').click();
     await new Promise((z) => setTimeout(z, 250));
-    const scope = (document.querySelector('#era-scope') || {}).value;
-    const pageNo = +document.querySelector('#pages .pbox.current').dataset.page;
-    const im = img();
-    const r = im.getBoundingClientRect();
-    // 横着来回扫三遍，压过页面顶部那几行正文（文字区就在 8%~19% 高度）
-    let pid = 90;
-    for (const frac of [0.085, 0.14, 0.185]) {
-      const y0 = r.top + r.height * frac;
-      im.dispatchEvent(mk('pointerdown', r.left + 30, y0, 1, ++pid));
-      for (let i = 1; i <= 44; i++) im.dispatchEvent(mk('pointermove', r.left + 30 + i * 9, y0, 1, pid));
-      im.dispatchEvent(mk('pointerup', r.left + 430, y0, 0, pid));
-      await new Promise((z) => setTimeout(z, 900));
-    }
+    const hasScope = !!document.querySelector('#era-scope');
+    const beforeSrc = img().src;
+    // 一次手势竖着从上扫到下，压过刚才那一笔（横线从页面左侧 1/12 处起，长度约半页）
+    const xx = r.left + r.width * 0.35;
+    img().dispatchEvent(mk('pointerdown', xx, r.top + 12, 1, ++pid));
+    for (let i = 1; i <= 60; i++) img().dispatchEvent(mk('pointermove', xx, r.top + 12 + i * (r.height - 24) / 60, 1, pid));
+    img().dispatchEvent(mk('pointerup', xx, r.top + r.height - 12, 0, pid));
     await new Promise((z) => setTimeout(z, 1800));
-    const after = await dark();
-    const toast = (document.querySelector('#toast') || {}).textContent || '';
-    return { before, after, scope, pageNo, toast, beforeSrc, afterSrc: img().src };
+    return {
+      before, drawn, after: await cnt(),
+      darkBefore, darkAfter: await dark(),
+      hasScope, objText,
+      toast: (document.querySelector('#toast') || {}).textContent || '',
+      srcChanged: img().src !== beforeSrc,
+    };
   })()`);
-  check('橡皮默认范围是「笔迹 + 页面内容」', contentErase.scope === 'all', String(contentErase.scope || contentErase.err));
-  check('橡皮把页面原有内容擦掉（页面位图变浅）', contentErase.after < contentErase.before - 3,
-    `第 ${contentErase.pageNo} 页 深色像素 ${contentErase.before} → ${contentErase.after}｜${contentErase.toast}`);
-  check('擦除结果里报了删掉的文字数量', /文字\s*\d+\s*处/.test(contentErase.toast || ''), contentErase.toast);
-  check('擦完页面位图已重新拉取', contentErase.afterSrc !== contentErase.beforeSrc);
+  check('橡皮参数栏不再提供「擦页面内容」', contentErase.hasScope === false,
+    contentErase.err || `era-scope=${contentErase.hasScope}`);
+  // 擦除是"切断"：一条笔迹被扫过后可能变成两段，所以条数未必减少，
+  // 但一定发生变化；纹理是否断开由像素断言兜底。
+  check('橡皮作用在自己画的笔迹上',
+    contentErase.after && contentErase.drawn && contentErase.after.strokes !== contentErase.drawn.strokes,
+    contentErase.err || `笔迹 ${contentErase.before && contentErase.before.strokes} → 画后 ${contentErase.drawn && contentErase.drawn.strokes} → 擦后 ${contentErase.after && contentErase.after.strokes}｜对象列表=${(contentErase.objText || '').replace(/\s+/g, ' ').slice(0, 60)}`);
+  check('橡皮不碰页面原有文字（条数不变）',
+    contentErase.after && contentErase.after.texts === contentErase.before.texts,
+    contentErase.err || `文字 ${contentErase.before && contentErase.before.texts} → ${contentErase.after && contentErase.after.texts}`);
+  check('橡皮不碰页面原有内容（深色像素不变）',
+    contentErase.darkBefore != null && Math.abs(contentErase.darkAfter - contentErase.darkBefore) <= 3,
+    contentErase.err || `深色像素 ${contentErase.darkBefore} → ${contentErase.darkAfter}｜${contentErase.toast}`);
+  check('擦完笔迹后页面位图已重新拉取', contentErase.srcChanged === true);
 
   // ---- 触摸 / 手写笔：手势不能被浏览器当成滚动抢走 ----
   console.log('\n== 触摸输入：笔画不被打断 ==');

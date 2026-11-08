@@ -39,7 +39,7 @@
     sid: '',              // 后端进程标识：重启后换掉，避免拿到上次进程的缓存位图
     ocrPages: new Set(),  // 已经手动识别过文字的页（不再自动 OCR）
     brush: { color: '#d64545', width: 2.2 },
-    eraser: { radius: 10, scope: 'all' },   // all=笔迹+页面原有内容；ink=只擦自己画的笔迹
+    eraser: { radius: 10 },   // 只擦自己画的笔迹，绝不碰页面原有内容
     textStyle: { size: 12, color: '#111111' },
   };
 
@@ -1275,7 +1275,7 @@
     }
 
     if (S.tool === 'erase') {
-      S.erasing = { points: [pt], radius: S.eraser.radius, scope: S.eraser.scope };
+      S.erasing = { points: [pt], radius: S.eraser.radius };
       paint('live');
       return;
     }
@@ -1422,26 +1422,18 @@
       S.erasing = null;
       paint('both');
       try {
+        // 橡皮只切笔迹：走 ink/erase 的 cut 模式，不调 /api/erase。
+        // 后者会命中页面原有文字（redaction 真删，撤销之外无法恢复），
+        // 在编辑正式文档时太容易误伤。
         let cut = { removed: 0 };
-        let area = null;
-        if (e0.scope === 'all') {
-          // 服务端一次搞定：擦页面内容 + 断开覆盖区内的笔迹
-          area = await api('/api/erase', {
-            json: { page: S.page, points: e0.points, radius: e0.radius },
-          });
-          cut = { removed: area.strokes_removed || 0 };
-        } else if ((S.objs.strokes || []).length) {
+        if ((S.objs.strokes || []).length) {
           cut = await api('/api/ink/erase', {
             json: { page: S.page, points: e0.points, radius: e0.radius, mode: 'cut' },
           });
         }
-        // 页面位图必须重拉：擦掉的是页面本身的内容，不是画布上的覆盖层
         await afterContentChange();
-        const bits = [];
-        if (cut.removed) bits.push(`笔迹 ${cut.removed} 处`);
-        if (area && area.removed_text_count) bits.push(`文字 ${area.removed_text_count} 处`);
-        if (area && area.covered) bits.push('内容已涂掉');
-        toast(bits.length ? '已擦除：' + bits.join(' · ') : '这里没有可擦除的内容', bits.length ? 'ok' : '');
+        toast(cut.removed ? `已擦除笔迹 ${cut.removed} 处` : '这里没有可擦除的笔迹',
+          cut.removed ? 'ok' : '');
       } catch (e) {
         toast(e.message, 'err');
         drawOverlay();
@@ -1637,20 +1629,13 @@
         $('#ink-width-val').textContent = S.brush.width;
       };
     } else if (S.tool === 'erase') {
-      bar.innerHTML = `<span>擦除范围</span>
-        <select id="era-scope">
-          <option value="all"${S.eraser.scope === 'all' ? ' selected' : ''}>笔迹 + 页面内容</option>
-          <option value="ink"${S.eraser.scope === 'ink' ? ' selected' : ''}>只擦我的笔迹</option>
-        </select>
-        <span>橡皮大小</span><input type="range" id="era-size" min="3" max="60" step="1" value="${S.eraser.radius}" />
+      // 只有笔迹可擦。曾经提供「笔迹 + 页面内容」的选项，结果很容易在
+      // 编辑正式文档时把原文一并抹掉（redaction 不可逆），这条能力收回到
+      // CLI / HTTP（pdfx erase、POST /api/erase）里，界面不再暴露。
+      bar.innerHTML = `<span>橡皮大小</span>
+        <input type="range" id="era-size" min="3" max="60" step="1" value="${S.eraser.radius}" />
         <span class="val" id="era-val">${S.eraser.radius}</span>
-        <span class="hint" style="margin:0" id="era-hint">${S.eraser.scope === 'all'
-          ? '拖过要擦的地方：笔迹与页面内容一起擦（Ctrl+Z 可撤销）'
-          : '只擦自己画的笔迹，页面原有内容不动'}</span>`;
-      $('#era-scope').onchange = (e) => {
-        S.eraser.scope = e.target.value;
-        renderFloatbar();
-      };
+        <span class="hint" style="margin:0">只擦你自己画的笔迹，页面原有文字与图片不受影响</span>`;
       $('#era-size').oninput = (e) => {
         S.eraser.radius = parseFloat(e.target.value);
         $('#era-val').textContent = S.eraser.radius;
@@ -2089,7 +2074,8 @@
       const j = await r.json();
       const caps = (j && j.data && j.data.caps) || [];
       // 缺任何一项新能力都算旧服务端：新前端会调到它没有的接口，用户只会觉得"点了没反应"
-      const need = ['text.transform', 'canvas.layered', 'erase.content', 'ocr.optional', 'bitmap.cached'];
+      // erase.guarded = /api/erase 已要求显式 allow_content，旧服务端会直接擦掉正文
+      const need = ['text.transform', 'canvas.layered', 'erase.guarded', 'ocr.optional', 'bitmap.cached'];
       if (!j.ok || need.some((k) => !caps.includes(k))) {
         throw new Error('stale');
       }

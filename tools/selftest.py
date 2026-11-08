@@ -143,7 +143,7 @@ def main() -> int:
     d.delete_pages("1")
     ok("删除页面", d.page_count == n0 - 1)
 
-    section("页面橡皮：擦掉页面原有内容（不只是自己画的笔迹）")
+    section("页面内容擦除（CLI / AI 接口能力；界面橡皮只擦笔迹，不提供这个）")
     d.close()
     d = fresh("samples/sample_text.pdf", "erase.pdf")
     before_txt = d.extract_text(0)["text"]

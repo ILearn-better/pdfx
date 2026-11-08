@@ -235,7 +235,7 @@ def create_app(initial: str | None = None) -> Flask:
             "caps": [
                 "docs", "doc.activate", "page.import",
                 "text.transform", "image.transform",
-                "ink.local_erase", "canvas.layered", "erase.content",
+                "ink.local_erase", "canvas.layered", "erase.content", "erase.guarded",
                 "ocr.optional", "bitmap.cached",
             ],
         }
@@ -531,11 +531,33 @@ def create_app(initial: str | None = None) -> Flask:
     @app.post("/api/erase")
     @_wrap
     def api_erase():
-        """页面级橡皮：把轨迹扫过的页面原有内容真正擦掉（文字真删 + 图像涂底色）。"""
+        """擦除接口。默认**只切笔迹**，页面原有内容必须显式允许。
+
+        界面上的橡皮只擦自己画的笔迹；擦页面内容（文字真删、图像涂掉）
+        是不可逆的破坏性操作，误触一次就能毁掉一页正式文档，所以 HTTP 这边
+        也要求调用方写明 allow_content=True 才放行。老版本前端不会传这个参数，
+        于是它即使没刷新页面也伤不到正文。
+        """
         b = _body()
         doc = SESSION.get(b.get("doc"))
+        pno = int(b["page"])
+        if not b.get("allow_content"):
+            pts = b.get("points")
+            rects = b.get("rects") or []
+            if not pts and not rects:
+                raise PdfxError("需要 points 或 rects", "bad_target")
+            total = {"page": pno, "removed": 0, "kept": 0, "split": 0}
+            jobs = []
+            if pts:
+                jobs.append({"points": pts, "radius": float(b.get("radius", 10))})
+            jobs.extend({"bbox": r} for r in rects)
+            for kw in jobs:
+                r = doc.erase_strokes(pno, mode="cut", **kw)
+                for k in ("removed", "kept", "split"):
+                    total[k] += int(r.get(k, 0) or 0)
+            return total
         return doc.erase_area(
-            int(b["page"]),
+            pno,
             points=b.get("points"),
             rects=b.get("rects"),
             radius=float(b.get("radius", 10)),

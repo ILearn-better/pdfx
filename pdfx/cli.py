@@ -371,7 +371,7 @@ def dispatch(args: argparse.Namespace) -> Any:
             print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
             raise SystemExit(4)
         caps = (payload.get("data") or {}).get("caps") or []
-        fresh = "erase.content" in caps and "ocr.optional" in caps
+        fresh = "erase.content" in caps and "ocr.optional" in caps and "erase.guarded" in caps
         print(json.dumps({"ok": True, "version": (payload.get("data") or {}).get("version"),
                           "caps": caps, "fresh": fresh}, ensure_ascii=False))
         raise SystemExit(0 if fresh else 3)

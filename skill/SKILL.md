@@ -86,7 +86,7 @@ pdfx search "a.pdf" "要核对的词"          # 4. 验证：新内容能搜到�
 | 移动缩放图 | `pdfx image transform a.pdf --page 0 --id "..." --rect 100,100,260,220 [--no-keep-ratio]` |
 | 手写笔迹 | `pdfx ink add a.pdf --page 0 --strokes '[{"points":[[60,700],[120,680]],"color":"#1a73e8","width":3}]'` |
 | 擦笔迹 | `pdfx ink erase a.pdf --page 0 --points "150,690;160,690" --radius 12` / `--bbox 100,680,200,720` |
-| 擦页面内容 | `pdfx erase a.pdf --page 0 --points "120,300;260,300" --radius 14` / `--rects "x0,y0,x1,y1;..."`（结构化页真删文字，扫描件涂纸色；`--no-text` 只涂不删）|
+| 擦页面内容（**界面不提供**） | `pdfx erase a.pdf --page 0 --points "120,300;260,300" --radius 14` / `--rects "x0,y0,x1,y1;..."`（结构化页真删文字，扫描件涂纸色；`--no-text` 只涂不删）。破坏性，只在明确要抹掉原文时用 |
 | 烘焙笔迹 | `pdfx ink flatten a.pdf` （转成矢量图形，之后不可再擦） |
 | 检索 | `pdfx search a.pdf "关键词" [--pages "0-2"] [--regex] [--ocr]` |
 | 导出文本 | `pdfx extract a.pdf -o out.txt [--ocr]` |
@@ -184,6 +184,7 @@ pdfx erase "a.pdf" --page 1 --points "120,560;300,640" --no-text   # 只涂不�
 ```
 
 > 一次调用同时处理「笔迹」和「页面内容」；可撤销（`pdfx undo a.pdf`）。
+> 注意这是命令行 / HTTP 能力：**界面上的橡皮只擦笔迹**，不会碰正文。
 
 **E. 挪动 / 缩放已有元素（不改内容）**
 
@@ -231,7 +232,7 @@ pdfx serve a.pdf --port 8765        # 打开 http://127.0.0.1:8765
 | POST/PUT/DELETE | `/api/text` | `{page, text, rect\|point}` / `{page, id, text}` / **`{page, id, rect, font_size?}` = 移动缩放** / `{page, id}` |
 | POST/PUT/DELETE | `/api/image` | `{page, rect, data_url}` / `{page, id, data_url}` / **`{page, id, rect, keep_ratio?}` = 移动缩放** / `{page, id, mode}`（`mode` 默认 `purge`＝redaction 真删，`cover`＝只涂纸色） |
 | POST | `/api/ink` `/api/ink/erase` | `{page, strokes}` / `{page, points|bbox, radius, mode}` |
-| POST | `/api/erase` | `{page, points|rects, radius, erase_text?}` 页面级橡皮：文字真删 + 图像涂纸色，返回 `{removed_text_count, covered, strokes_removed, fill}` |
+| POST | `/api/erase` | `{page, points|rects, radius, allow_content?, erase_text?}`。**默认只切笔迹**（等价 `ink/erase --mode cut`）；擦页面内容必须显式 `allow_content: true`，此时文字真删 + 图像涂纸色，返回 `{removed_text_count, covered, strokes_removed, fill}` |
 | POST | `/api/page` `/api/page/move` | 页面增删移 |
 | POST | `/api/save` `/api/undo` | 落盘（新文档要带 `path` + `as_current`）/ 撤销 |
 
@@ -296,6 +297,8 @@ id 形如 `p0:i@56,500`（左上角坐标取整），**不带 xref**。原因：
   对法律意义极强的文件，应重新生成而非覆盖。
 - **`erase` 是破坏性的**：结构化页命中的文字会被 redaction 真删（不可恢复，只能靠 `undo`）。
   只想修自己画的笔迹就用 `ink erase`，别用 `erase`。
+  界面的橡皮已经**只擦笔迹**：用户拿它扫正文是擦不掉的，别指望用它改原文。
+  HTTP 调 `/api/erase` 时也必须显式 `allow_content: true` 才会动页面内容。
 - **浏览器页面要设 `touch-action: none`**：否则在触摸屏/手写笔上，拖动会被判成滚动，
   只收到 `pointercancel` —— 表现就是「画笔只画两个点、橡皮完全没反应」。
 - **对象会重叠，位置不可靠**：插入的图片/文本压在原文之上，`objects` 里同一坐标可能同时

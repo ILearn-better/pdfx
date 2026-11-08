@@ -189,8 +189,8 @@ with PDFDocument("报告.pdf") as d:
 | **页面** | 按页码/范围删除，至少保留一页 | 一致 | 左栏「删除本页」/ `page delete --pages "1,3-4"` / `DELETE /api/page` |
 | **文本** | 可按 id 精确删，也可给 bbox 按区域删；**包括 OCR 识别出的文字** | 结构化：redaction 真删<br>扫描件：背景色覆盖 | 选中对象 → 属性面板「删除」/ `text delete --id "p0:t56,57"` / `DELETE /api/text` |
 | **图片** | 按显示实例删除（同一张图多处摆放可分别删） | 两者都走 **redaction 真删**：图像从内容流移除，底下被遮住的文字会露出来。同一张图被摆在多处时共用同一个图像资源，删一处后其余落点会自动补画回去，不会连带消失 | 选中 → 「删除」/ `image delete --id "p0:i@56,500"` / `DELETE /api/image`（默认 `mode=purge`） |
-| **笔迹** | **笔画级**或**像素级**擦除：橡皮轨迹经过处把笔画切开，只去掉经过的部分 | 一致（笔迹是独立注释层，不碰原内容） | 选「橡皮」→ 拖过笔迹 → 松手 / `ink erase --points "x,y;x,y" --radius 12` / 也可 `--bbox` 框选整条擦 |
-| **页面原有内容** | 橡皮扫过的**页面本身**也能擦：命中的文字真删（结构化页 redaction，删完检索不到），图像内容按纸色涂掉（扫描件上的手写字、印章一并去掉）。一次擦除同时处理笔迹与内容 | 结构化：文字真删 + 涂纸色<br>扫描件：涂纸色（纸色取擦除区周边众数色，不会留明显白块） | UI：橡皮参数栏「擦除范围」选 **笔迹 + 页面内容**（默认）→ 按住拖过要擦的地方；只想修自己的笔迹就切到「只擦我的笔迹」<br>CLI：`erase --points "x,y;x,y" --radius 12` 或 `--rects "x0,y0,x1,y1;..."`<br>API：`POST /api/erase`<br>Python：`doc.erase_area(page, points=…\|rects=…)` |
+| **笔迹** | **只会擦笔迹**：橡皮轨迹经过处把笔画切开，只去掉经过的部分，页面原有文字与图片分毫不动 | 一致（笔迹是独立注释层，不碰原内容） | 选「橡皮」→ 拖过笔迹 → 松手 / `ink erase --points "x,y;x,y" --radius 12` / 也可 `--bbox` 框选整条擦 |
+| **页面原有内容**（仅 CLI / AI 提供，界面橡皮不提供） | 抹掉页面本身的像素：命中的文字真删（结构化页 redaction，删完检索不到），图像内容按纸色涂掉（扫描件上的手写字、印章）。**不可逆**，只能在撤销栈里回退 | 结构化：文字真删 + 涂纸色<br>扫描件：涂纸色（纸色取擦除区周边众数色，不会留明显白块） | CLI：`erase --points "x,y;x,y" --radius 12` 或 `--rects "x0,y0,x1,y1;..."`（命令行本身就是显式调用）<br>API：`POST /api/erase` **必须带 `allow_content: true`**，不带时只切笔迹<br>Python：`doc.erase_area(page, points=…\|rects=…)` |
 
 ### 3.4 改：文本与图片
 
@@ -289,8 +289,8 @@ python tools/install_skill.py
 ```bash
 python tools/make_samples.py     # 生成三类样本（结构化 / 扫描 / 混合）
 python tools/selftest.py         # 端到端 66 项，纯 Python API
-python tools/api_smoke.py        # HTTP 28 项，自动起停独立服务
-node   tools/uitest.mjs          # 界面 62 项，真实浏览器点击/拖拽/触摸（需 node 18+ 与 Edge/Chrome）
+python tools/api_smoke.py        # HTTP 29 项，自动起停独立服务
+node   tools/uitest.mjs          # 界面 63 项，真实浏览器点击/拖拽/触摸（需 node 18+ 与 Edge/Chrome）
 python tools/bench.py            # 性能基准（不是断言，用来看数字有没有退化）
 ```
 
@@ -301,7 +301,7 @@ python tools/bench.py            # 性能基准（不是断言，用来看数字
   不会去连你可能正在用的 8765 实例。
 - `uitest.mjs` 用 CDP 驱动无头 Edge，真派发 PointerEvent 测「新建 → 画笔 → 流畅度 →
   撤销 → 橡皮即时切断 → 文本框插入/移动/缩放 → 图片直接插入/缩放/整体拖动/无残影 →
-  删图后重新插入 → 三种视图 → 文档切换 → 另存为对话框 → 插入 PDF → 橡皮擦页面内容 →
+  删图后重新插入 → 三种视图 → 文档切换 → 另存为对话框 → 插入 PDF → 橡皮只擦笔迹（正文分毫不动）→
   触摸书写 → OCR 手动触发」，截图写到 `tmp/shots/`。
   几条专门的守门断言：
   - `elementFromPoint` 检查画布没被其他元素遮挡 —— DOM 里存在不等于用户看得见
@@ -321,3 +321,5 @@ python tools/bench.py            # 性能基准（不是断言，用来看数字
   - 同一张图插两次、删掉其中一个，另一个必须还在（后端断言）
     —— 两处共用同一个图像资源，redaction 删资源会把两处一起抹掉
   - 打开扫描件时对象列表里**不能出现 OCR 行**，点「识别本页」之后才允许出现
+  - 橡皮扫过正文之后，页面深色像素数、文本条数都必须**完全不变**，只有笔迹被切断
+    —— 曾经把「擦页面内容」做进界面，误扫一遍就把正文真删了，redaction 不可逆
