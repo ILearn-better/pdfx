@@ -82,7 +82,7 @@ pdfx search "a.pdf" "要核对的词"          # 4. 验证：新内容能搜到�
 | 列图片 | `pdfx image list a.pdf --page 0` |
 | 加图片 | `pdfx image add a.pdf --page 0 --rect 300,520,420,600 --src logo.png` |
 | 换图片 | `pdfx image replace a.pdf --page 0 --id "p0:i@56,500" --src new.png` |
-| 删图片 | `pdfx image delete a.pdf --page 0 --id "p0:i@56,500" [--mode purge]` |
+| 删图片 | `pdfx image delete a.pdf --page 0 --id "p0:i@56,500"`（默认真删；`--mode cover` 只涂纸色） |
 | 移动缩放图 | `pdfx image transform a.pdf --page 0 --id "..." --rect 100,100,260,220 [--no-keep-ratio]` |
 | 手写笔迹 | `pdfx ink add a.pdf --page 0 --strokes '[{"points":[[60,700],[120,680]],"color":"#1a73e8","width":3}]'` |
 | 擦笔迹 | `pdfx ink erase a.pdf --page 0 --points "150,690;160,690" --radius 12` / `--bbox 100,680,200,720` |
@@ -281,6 +281,10 @@ id 形如 `p0:i@56,500`（左上角坐标取整），**不带 xref**。原因：
 不要退回去用"涂一块纸色盖住"——旧图还留在内容流里，之后往同一位置插新图时，
 按位置匹配会抓到那张旧图，记录里的 bbox 就写成旧位置，表现为「删了图再也插不进来」。
 只有明确想保留底层内容做底稿时才用 `mode="cover"`。
+
+**注意 redaction 删的是"图像资源"而不是"某一次摆放"**：同一张图在页面上摆了两处时，
+删一处会把两处一起抹掉。本工具的做法是先把其他落点记下来，删完按原 bbox 补画回去
+（`_redact_image_only`），所以删/移一张不会连带另一张。自己调 PyMuPDF 时要自己处理这件事。
 
 ## 坑点清单
 

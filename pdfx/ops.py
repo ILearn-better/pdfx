@@ -1046,6 +1046,60 @@ class ImageMixin:
         # 直接把内部 dict 交出去的话，调用方拿到的"插入时 bbox"会自己变掉
         return dict(rec)
 
+    def _redact_image_only(self, page: fitz.Page, rect: Any, xref: Any = None) -> bool:
+        """把 rect 处的图像从内容流里删掉，但保留同一张图在页面上的其他落点。
+
+        redaction 删的是"图像资源"，不是"某一次摆放"。同一张图（相同 xref）
+        在页面上摆了两个位置时，删一处会把两处一起抹掉 —— 用户把同一张图插
+        两次、删掉其中一个，另一个会凭空消失。所以先把其他落点记下来，
+        删完按原 bbox 补画回去。返回 False 表示 redaction 没成功，调用方应退回涂色。
+        """
+        target = _rect_list(fitz.Rect(*rect))
+        siblings: list[list[float]] = []
+        data = None
+        if xref:
+            try:
+                siblings = [
+                    i["bbox"]
+                    for i in self._image_instances(page)
+                    if i["xref"] == int(xref) and iou(i["bbox"], target) < 0.3
+                ]
+            except Exception:
+                siblings = []
+            if siblings:
+                try:
+                    data = self.doc.extract_image(int(xref))["image"]
+                except Exception:
+                    data = None
+                if not data:
+                    siblings = []
+        try:
+            page.add_redact_annot(fitz.Rect(*target))
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_REMOVE,
+                text=fitz.PDF_REDACT_TEXT_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+            )
+        except Exception:
+            return False
+        restored: list[tuple[list[float], int]] = []
+        for b in siblings:
+            try:
+                nx = page.insert_image(fitz.Rect(*b), stream=data, keep_proportion=False, overlay=True)
+                restored.append((b, int(nx)))
+            except Exception:
+                pass
+        # 补画出来的实例换了新 xref，state 里的记录要跟着改 ——
+        # 否则下次按 xref 判断"还有没有别的落点"会落空。
+        if restored:
+            st = self._pstate(page)
+            for b, nx in restored:
+                for rec in st.get("images", []):
+                    if iou(rec["bbox"], b) > 0.6:
+                        rec["bbox"] = _rect_list(fitz.Rect(*b))
+                        rec["xref"] = nx
+        return True
+
     def replace_image(self, page_no: int, target: Any, src: Any, keep_ratio: bool = True) -> dict[str, Any]:
         items = self.list_images(page_no)["items"]
         item = self._pick_image(items, target)
@@ -1057,14 +1111,7 @@ class ImageMixin:
         # 涂色的后果是旧图仍在内容流里，之后任何"按位置找实例"的操作都可能抓到它，
         # 记录里的 bbox 就会被写成旧图的位置。
         old = _rect_list(fitz.Rect(*item["bbox"]))
-        try:
-            page.add_redact_annot(fitz.Rect(*old))
-            page.apply_redactions(
-                images=fitz.PDF_REDACT_IMAGE_REMOVE,
-                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-                text=fitz.PDF_REDACT_TEXT_NONE,
-            )
-        except Exception:
+        if not self._redact_image_only(page, old, item.get("xref")):
             self._cover(page, old, color=self._paper_color(page))
             if item["source"] == "user":
                 self._suppress(page, old)  # 用户图重绘在别处时，旧实例也要从列表里退场
@@ -1104,14 +1151,7 @@ class ImageMixin:
         rect = _rect_list(fitz.Rect(*item["bbox"]))
         done = "purged"
         if mode != "cover":
-            try:
-                page.add_redact_annot(fitz.Rect(*rect))
-                page.apply_redactions(
-                    images=fitz.PDF_REDACT_IMAGE_REMOVE,
-                    graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-                    text=fitz.PDF_REDACT_TEXT_NONE,
-                )
-            except Exception:
+            if not self._redact_image_only(page, rect, item.get("xref")):
                 self._cover(page, rect, color=self._paper_color(page))
                 done = "cover"
         else:
@@ -1174,14 +1214,7 @@ class ImageMixin:
         # 不要靠"xref 是否唯一"来决定要不要删：同样字节的图会被 PyMuPDF 复用成
         # 同一个 xref，replace_image 之后同一位置甚至叠着两个实例，判断必然失手，
         # 结果退回涂色又被上层实例盖住 → 原位残留一个一模一样的残影。
-        try:
-            page.add_redact_annot(old_rect)
-            page.apply_redactions(
-                images=fitz.PDF_REDACT_IMAGE_REMOVE,
-                text=fitz.PDF_REDACT_TEXT_NONE,
-                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-            )
-        except Exception:
+        if not self._redact_image_only(page, old, item.get("xref")):
             # redaction 失败就退化为用页面纸张底色盖住（至少不会两个影子）
             self._cover(page, old, color=self._paper_color(page))
             self._suppress(page, old)

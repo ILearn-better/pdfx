@@ -1071,7 +1071,9 @@
 
   async function deleteImage(o) {
     try {
-      await api('/api/image', { method: 'DELETE', json: { page: S.page, id: o.id } });
+      // 显式要 purge：真删。不写依赖服务端默认值 —— 默认值一旦回退成 cover，
+      // 图只是被盖住，保存后原图仍在文件里，同一位置再插图也容易认错旧实例。
+      await api('/api/image', { method: 'DELETE', json: { page: S.page, id: o.id, mode: 'purge' } });
       S.sel = null;
       await afterContentChange();
       toast('已删除图片', 'ok');

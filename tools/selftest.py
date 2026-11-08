@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from pdfx import PDFDocument  # noqa: E402
-from pdfx.util import PdfxError  # noqa: E402
+from pdfx.util import PdfxError, iou  # noqa: E402
 
 TMP = ROOT / "tmp" / "selftest"
 PASS = 0
@@ -227,6 +227,37 @@ def main() -> int:
     same_spot = d.add_image(0, [80, 300, 240, 380], ROOT / "samples" / "logo.png", name="again.png")
     ok("同一位置重复插入不会丢图", len(d.list_images(0)["items"]) == 2,
        f"bbox={[round(v, 1) for v in same_spot['bbox']]}")
+
+    # 界面点「删除」不传 mode，默认必须真删。若默认回退成 cover，
+    # 图只被纸色盖住，内容流里还在 —— 保存后原图仍可被提取。
+    imgs_before = len(d.list_images(0)["items"])
+    victim = d.list_images(0)["items"][-1]
+    res = d.delete_image(0, victim["id"])
+    ok("删除默认走真删（mode=purged）", res.get("mode") == "purged", str(res.get("mode")))
+    remain = d.list_images(0)["items"]
+    ok("删完之后对象列表里没有它",
+       all(x["id"] != victim["id"] for x in remain), f"剩 {len(remain)} 张")
+    # 同一张图插两次会共用同一个图像资源（xref），redaction 按资源删会把两处一起抹掉
+    ok("同一张图在别处的实例仍然保留", len(remain) == imgs_before - 1,
+       f"{imgs_before} → {len(remain)} 张")
+    ok("原位置的图像已从内容流移除",
+       not any(iou(i["bbox"], victim["bbox"]) > 0.3 for i in d._image_instances(d.doc[0])))
+    d.undo()
+    ok("删除可撤销：图回来了",
+       any(x["id"] == victim["id"] for x in d.list_images(0)["items"]),
+       f"{len(d.list_images(0)['items'])} 张")
+    d.close()
+
+    # 同一张图插两次 → 共用同一个图像资源。移动其中一张时，
+    # redaction 按资源删会把两处一起抹掉，所以另一处必须补画回来。
+    d = fresh("samples/sample_text.pdf", "multi_img.pdf")
+    d.add_image(0, [80, 300, 240, 380], ROOT / "samples" / "logo.png", name="m1.png")
+    p2 = d.add_image(0, [300, 300, 460, 380], ROOT / "samples" / "logo.png", name="m2.png")
+    d.transform_image(0, p2["id"], [300, 420, 460, 500])
+    users = [i for i in d.list_images(0)["items"] if i["source"] == "user"]
+    ok("移动一张图不会带走同款的另一张", len(users) == 2, f"{len(users)} 张")
+    ok("被移动的那张落在新位置", any(abs(i["bbox"][1] - 420) < 30 for i in users),
+       str([[round(v) for v in i["bbox"]] for i in users]))
     d.close()
 
     d = fresh("samples/sample_scan.pdf", "ocr_opt.pdf")

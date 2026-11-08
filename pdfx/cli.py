@@ -267,7 +267,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(s, mutate=True)
     s.add_argument("--page", type=int, default=0)
     s.add_argument("--id", required=True)
-    s.add_argument("--mode", choices=["cover", "purge"], default="cover")
+    s.add_argument("--mode", choices=["cover", "purge"], default="purge",
+                   help="purge=从内容流真删（默认）；cover=只涂纸色盖住")
     s = isub.add_parser("transform", help="移动/缩放图片（不改内容）")
     add_common(s, mutate=True)
     s.add_argument("--page", type=int, default=0)

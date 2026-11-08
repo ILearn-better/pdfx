@@ -496,7 +496,10 @@ def create_app(initial: str | None = None) -> Flask:
     def api_image_delete():
         b = _body()
         doc = SESSION.get(b.get("doc"))
-        return doc.delete_image(int(b["page"]), b.get("id"), mode=b.get("mode", "cover"))
+        # 默认 purge：真删。界面点「删除」不带 mode，若这里退回 cover，
+        # 图只是被纸色盖住、仍留在内容流里 —— 看起来删了，保存后原图还能被提取，
+        # 之后往同一处插新图也更容易踩到旧实例。
+        return doc.delete_image(int(b["page"]), b.get("id"), mode=b.get("mode", "purge"))
 
     # ------------------------------------------------------------------ 笔迹
     @app.get("/api/ink")

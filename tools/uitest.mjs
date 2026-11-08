@@ -706,6 +706,65 @@ async function main() {
   check('新图片真的画进了页面位图', reinsertUi.green > 200, `${reinsertUi.green} 个绿色像素`);
   await shot('image-reinserted');
 
+  // ---- 界面点「删除」：必须真删 ----
+  // 这条覆盖的是"接口默认值"这个坑：界面调 DELETE 时不带 mode，
+  // 服务端若默认 cover，图只是被纸色盖住，看起来删了、实际还在内容流里。
+  console.log('\n== 界面删除图片 ==');
+  const uiDel = await ev(`(async () => {
+    const doc = (await (await fetch('/api/docs')).json()).data.current;
+    const list = async () => (await (await fetch('/api/image?page=0&doc=' + doc)).json())
+      .data.items.filter((x) => x.source === 'user');
+    const items = await list();
+    const it = items[items.length - 1];
+    if (!it) return { err: '没有可点的图' };
+    const size = (await (await fetch('/api/doc?doc=' + doc)).json()).data.pages[0].size;
+    const box = document.querySelector('#pages .pbox.current');
+    const r = box.getBoundingClientRect();
+    const k = r.width / size[0];
+    const cx = r.left + (it.bbox[0] + it.bbox[2]) / 2 * k;
+    const cy = r.top + (it.bbox[1] + it.bbox[3]) / 2 * k;
+    const el = box.querySelector('img');
+    const mk = (t, b) => new PointerEvent(t, { clientX: cx, clientY: cy, bubbles: true,
+      cancelable: true, pointerId: 71, pointerType: 'mouse', isPrimary: true, button: 0, buttons: b });
+    el.dispatchEvent(mk('pointerdown', 1));
+    el.dispatchEvent(mk('pointerup', 0));
+    await new Promise((z) => setTimeout(z, 350));
+    const props = ((document.querySelector('#props') || {}).textContent || '').replace(/\\s+/g, ' ');
+    const btn = document.querySelector('#p-del');
+    if (!btn) return { err: '属性面板里没有删除按钮', props };
+    btn.click();
+    await new Promise((z) => setTimeout(z, 1800));
+    const after = await list();
+    let green = 0;
+    try {
+      const im = document.querySelector('#pages .pbox.current img');
+      await im.decode();
+      const cc = document.createElement('canvas');
+      cc.width = size[0]; cc.height = size[1];
+      const g = cc.getContext('2d');
+      g.drawImage(im, 0, 0, size[0], size[1]);
+      const b = it.bbox;
+      const w = Math.max(1, Math.round(b[2] - b[0]) - 10);
+      const h = Math.max(1, Math.round(b[3] - b[1]) - 10);
+      const d = g.getImageData(Math.round(b[0]) + 5, Math.round(b[1]) + 5, w, h).data;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i] < 90 && d[i + 1] > 90 && d[i + 2] < 130) green++;
+      }
+    } catch (e) { /* 读不到像素只靠列表判断 */ }
+    return {
+      pickedImage: !/文本内容/.test(props), props,
+      before: items.length, after: after.length,
+      gone: !after.some((x) => x.id === it.id), green,
+      toast: document.querySelector('#toast').textContent,
+    };
+  })()`);
+  check('点中图片后属性面板允许删除', uiDel.pickedImage === true, uiDel.err || uiDel.props);
+  check('界面点「删除」后图片从对象列表消失', uiDel.gone === true,
+    uiDel.err || `${uiDel.before} → ${uiDel.after}`);
+  check('界面删除是真删：原位置不再残留图片像素', uiDel.green != null && uiDel.green < 20,
+    uiDel.err || `${uiDel.green} 个绿色像素`);
+  await shot('image-deleted');
+
   // ---- 三种浏览方式 ----
   console.log('\n== 浏览方式 ==');
   const singleBoxes = await ev(`document.querySelectorAll('#pages .pbox').length`);

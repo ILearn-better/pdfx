@@ -161,6 +161,26 @@ def main() -> int:
     ok_all &= check("POST /api/erase（擦页面内容）",
                     er2["covered"] >= 1, f"covered={er2['covered']} 文字={er2['removed_text_count']} 笔迹={er2['strokes_removed']}")
 
+    # ---- 图片：插入 → 删除 → 同一位置再插入 ----
+    # 界面点「删除」不会传 mode。接口默认值必须是真删（purge），
+    # 否则图只是被纸色盖住，保存后原图仍在文件里，之后再插图也容易认错旧实例。
+    img = call("/api/image", {"page": 0, "rect": [100, 400, 220, 480], "path": "samples/logo.png"})["data"]
+    ok_all &= check("POST /api/image", str(img.get("id", "")).startswith("p0:ui"),
+                    f"{img.get('id')} {img.get('bbox')}")
+
+    gone = call("/api/image", {"page": 0, "id": img["id"]}, method="DELETE")["data"]
+    ok_all &= check("DELETE /api/image 不带 mode 也真删", gone.get("mode") == "purged", str(gone.get("mode")))
+
+    left = call("/api/image?page=0")["data"]["items"]
+    ok_all &= check("删完之后图片列表里没有它", all(i["id"] != img["id"] for i in left),
+                    f"{len(left)} 项")
+
+    again = call("/api/image", {"page": 0, "rect": [100, 400, 220, 480], "path": "samples/logo.png"})["data"]
+    ok_all &= check("同一位置还能再插一张（bbox 落在指定位置）",
+                    again.get("id") != img["id"] and abs(again["bbox"][0] - 100) < 2,
+                    f"{again.get('id')} {again.get('bbox')}")
+
+    # 页面删除放到最后、在新文档上做：删的是第 0 页，主文档还要靠它出文字
     ext = call("/api/extract", {})["data"]
     ok_all &= check("POST /api/extract", "采购合同" in ext["text"], f"{ext['total_chars']} chars")
 
@@ -185,6 +205,10 @@ def main() -> int:
     imp = call("/api/page/import", {"path": "samples/sample_text.pdf", "pages": "all", "at": 1, "doc": new_id})["data"]
     ok_all &= check("POST /api/page/import", imp["imported_count"] == 2 and imp["page_count"] == 3,
                     f"插入 {imp['imported_count']} 页 → 共 {imp['page_count']} 页")
+
+    pg = call("/api/page", {"pages": [0], "doc": new_id}, method="DELETE")["data"]
+    ok_all &= check("DELETE /api/page 删掉一页", pg["page_count"] == 2,
+                    f"3 → {pg['page_count']} 页")
 
     first_id = docs["docs"][0]["doc_id"]
     act = call("/api/doc/activate", {"doc": first_id})["data"]
