@@ -20,7 +20,7 @@ auto_trigger:
 ## 何时用
 
 - 用户给出一个 PDF，要求**改字、删页、加字、插图、手写批注、盖章式标注、检索内容、导出文本**
-- 该 PDF 可能是**扫描件/照片**（没有文本层），普通 PDF 库改不动 —— 本工具会自动 OCR 并支持"贴补式"编辑
+- 该 PDF 可能是**扫描件/照片**（没有文本层），普通 PDF 库改不动 —— 本工具能按需 OCR 并支持"贴补式"编辑
 - 需要在扫描件上"把某行字改掉"这类传统工具做不到的操作
 
 ## 环境
@@ -52,7 +52,7 @@ auto_trigger:
 
 ```bash
 pdfx describe "a.pdf"                    # 1. 看几页、每页是 text 还是 scanned、有多少对象
-pdfx text list "a.pdf" --page 0          # 2. 列出该页文本行（扫描页自动 OCR），拿 id
+pdfx text list "a.pdf" --page 0          # 2. 列出该页文本行，拿 id（扫描页需加 --ocr）
 pdfx text update "a.pdf" --page 0 --id "p0:o57,429" --text "新内容"   # 3. 精确改
 pdfx search "a.pdf" "要核对的词"          # 4. 验证：新内容能搜到、旧内容搜不到
 ```
@@ -115,13 +115,18 @@ pdfx search "a.pdf" "要核对的词"          # 4. 验证：新内容能搜到�
 
 | 操作 | 结构化 PDF | 扫描件 PDF |
 |---|---|---|
-| 读文本 | 直接读文本层（精确、便宜） | 渲染 200dpi → OCR（有缓存） |
+| 读文本 | 直接读文本层（精确、便宜） | **按需** OCR：`force_ocr=True` / `--ocr` 才识别，结果按图像指纹缓存 |
 | 改文本 | redaction 真删原字，再按原字号/颜色重绘 | 用页面底色**覆盖**原像素，再绘新字 |
 | 删文本 | redaction 删除（保留图像与矢量） | 画背景色块盖住 |
 | 检索 | 文本层匹配 | OCR 行匹配，支持"忽略空白"（OCR 常把 `12,000` 拆成 `1 2，0 0 0`） |
 
 判断依据是**位图覆盖率**而非"有没有文字"：扫描页插入了新文本后仍然是 `mixed`，
 检索依然会 OCR，不会丢掉原图内容。
+
+> **浏览/列文本时 OCR 默认关闭。** 扫描页的 `list_text(page)` 默认返回空列表（只有文本层），
+> 这是刻意的：整页 200dpi 识别要 1~3 秒，界面翻页会一直卡。需要文字时显式传 `force_ocr=True`
+> （CLI 是 `--ocr`，HTTP 是 `?ocr=1`）。`search()` 和 `extract_text()` 例外 —— 它们是显式动作，
+> 扫描页会自动识别。
 
 已知边界：
 
@@ -220,11 +225,11 @@ pdfx serve a.pdf --port 8765        # 打开 http://127.0.0.1:8765
 | POST | `/api/doc/activate` | `{doc}` 切换当前文档 |
 | POST | `/api/new` | `{size, pages}` 新建独立文档，返回 `path: null` |
 | POST | `/api/page/import` | `{path\|data_url, pages, at}` 把另一份 PDF 的页插进来 |
-| GET | `/api/page/{i}/objects` | 该页文本/图片/笔迹清单 |
-| GET | `/api/page/{i}.png?dpi=110` | 页面位图 |
+| GET | `/api/page/{i}/objects?ocr=0\|1` | 该页文本/图片/笔迹清单。`ocr=0`（默认）只读文本层，扫描页 `texts` 为空；`ocr=1` 才识别 |
+| GET | `/api/page/{i}.png?dpi=110` | 页面位图。URL 可加 `&s=<sid>&r=<rev>` 让浏览器长期缓存（`/api/doc` 会回这两个值） |
 | POST | `/api/search` | `{query, pages?, regex?, force_ocr?}` |
 | POST/PUT/DELETE | `/api/text` | `{page, text, rect\|point}` / `{page, id, text}` / **`{page, id, rect, font_size?}` = 移动缩放** / `{page, id}` |
-| POST/PUT/DELETE | `/api/image` | `{page, rect, data_url}` / `{page, id, data_url}` / **`{page, id, rect, keep_ratio?}` = 移动缩放** / `{page, id, mode}` |
+| POST/PUT/DELETE | `/api/image` | `{page, rect, data_url}` / `{page, id, data_url}` / **`{page, id, rect, keep_ratio?}` = 移动缩放** / `{page, id, mode}`（`mode` 默认 `purge`＝redaction 真删，`cover`＝只涂纸色） |
 | POST | `/api/ink` `/api/ink/erase` | `{page, strokes}` / `{page, points|bbox, radius, mode}` |
 | POST | `/api/erase` | `{page, points|rects, radius, erase_text?}` 页面级橡皮：文字真删 + 图像涂纸色，返回 `{removed_text_count, covered, strokes_removed, fill}` |
 | POST | `/api/page` `/api/page/move` | 页面增删移 |
@@ -244,7 +249,7 @@ from pdfx import PDFDocument
 
 with PDFDocument("a.pdf") as d:
     print(d.page_type(0))                       # text / scanned / mixed
-    for line in d.list_text(0)["items"]:        # 扫描页自动 OCR
+    for line in d.list_text(0, force_ocr=True)["items"]:   # 扫描页要显式要求 OCR
         print(line["id"], line["bbox"], line["text"])
     d.update_text(0, "p0:o57,429", "新内容")     # 两类 PDF 同一套调用
     print(d.search("新内容")["total"])
@@ -272,8 +277,10 @@ id 形如 `p0:i@56,500`（左上角坐标取整），**不带 xref**。原因：
 图片资源。按位置匹配才稳定。
 
 因此：`list_images` → 拿 id → 立刻操作，中间不要插入别的图片操作。
-`delete_image` 默认 `mode="cover"`（用页面底色覆盖，视觉删除，可撤销）；
-只有 `mode="purge"` 才真正从内容流里移除。
+`delete_image` 默认 `mode="purge"`：用 redaction 把这块区域的图像从内容流里真正移除。
+不要退回去用"涂一块纸色盖住"——旧图还留在内容流里，之后往同一位置插新图时，
+按位置匹配会抓到那张旧图，记录里的 bbox 就写成旧位置，表现为「删了图再也插不进来」。
+只有明确想保留底层内容做底稿时才用 `mode="cover"`。
 
 ## 坑点清单
 
@@ -293,6 +300,11 @@ id 形如 `p0:i@56,500`（左上角坐标取整），**不带 xref**。原因：
 - **`image transform` 会真的删掉原图**：走的是 redaction（`images=REMOVE`、`text=NONE`、
   `graphics=NONE`），所以底下被它遮住的文字会重新露出来、不会留白斑。
   反过来说，原位下方原本没有内容时就变空白 —— 这是不可逆的，除非 `undo`。
+- **OCR 是要花钱的**：`list_text` / `objects` 默认只读文本层，扫描页返回空列表。
+  批量处理扫描件时，先 `describe` 看清哪几页是 `scanned`，只对需要的页传 `force_ocr=True`，
+  别对整本循环调用。识别结果按页面图像指纹缓存 7 天，改过页面内容的页会重新识别。
+- **位图 URL 别自己加随机参数**：`/api/page/{i}.png` 支持 `s`/`r` 两个查询参数做缓存键，
+  乱加时间戳会让后端每次重新渲染（一页 40~150ms）。
   不要用「先涂色再重画」的思路自己实现，图片区域取「边缘众数色」取到的就是图片本身。
 - **页码是 0 基，不是 1 基**。`--page 0` = 第一页；`--pages "1-3"` = 第 2、3、4 页。
   界面上显示的"第 N 页"是给人看的（1 基），API 与 CLI 一律 0 基，别混。

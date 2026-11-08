@@ -42,6 +42,8 @@ class Session:
         self.current: str | None = None
         self._seq = 1
         self.lock = threading.RLock()
+        # 进程唯一标识：位图 URL 里带上它，进程重启后浏览器不会拿上一次的缓存图。
+        self.sid = os.urandom(4).hex()
 
     def add(self, doc: PDFDocument, name: str | None = None) -> str:
         # 同一路径只留一个实例：两个句柄同时开着，Windows 上 os.replace 会失败，
@@ -128,7 +130,14 @@ def _wrap(fn):
                 data = fn(*args, **kwargs)
             if isinstance(data, tuple):
                 return jsonify(data[0]), data[1]
-            return jsonify(ok(data))
+            payload = ok(data)
+            # 顺手把当前文档的修订号回给前端：位图 URL 用它做缓存键，
+            # 内容一变 URL 就变，既能放心让浏览器缓存，又不会拿到旧图。
+            cur = SESSION.docs.get(SESSION.current) if SESSION.current else None
+            if cur is not None and isinstance(payload.get("data"), dict):
+                payload["data"].setdefault("rev", cur.rev)
+                payload["data"].setdefault("sid", SESSION.sid)
+            return jsonify(payload)
         except PdfxError as exc:
             return jsonify(fail(exc)), 400
         except Exception as exc:  # pragma: no cover
@@ -146,13 +155,17 @@ def create_app(initial: str | None = None) -> Flask:
 
     @app.after_request
     def _no_api_cache(resp):
-        """JSON 接口必须每次拿到最新状态。
+        """页面位图允许浏览器缓存，其余 JSON 接口一律不缓存。
 
-        浏览器对没有缓存头的响应会做启发式缓存，拖动提交后前端再查对象列表
-        可能拿到拖之前那一份 —— 表现是「东西挪了，但选框和属性还停在原位」。
-        页面位图靠 URL 里的 v=版本号 规避，接口这边显式禁用。
+        位图 URL 里带了 doc / sid / rev（修订号），内容一变 URL 就变，
+        所以长期缓存是安全的 —— 这一点直接决定了缩放、翻回上一页的体感：
+        以前每张图都是 no-store，放大一次就要把所有页重新渲染 + 重新传输。
         """
-        if request.path.startswith("/api/"):
+        p = request.path
+        if p.startswith("/api/page/") and p.endswith(".png"):
+            resp.headers["Cache-Control"] = "private, max-age=86400"
+            return resp
+        if p.startswith("/api/"):
             resp.headers["Cache-Control"] = "no-store, max-age=0"
         return resp
 
@@ -218,10 +231,12 @@ def create_app(initial: str | None = None) -> Flask:
         """
         return {
             "version": PDFX_VERSION,
+            "sid": SESSION.sid,
             "caps": [
                 "docs", "doc.activate", "page.import",
                 "text.transform", "image.transform",
                 "ink.local_erase", "canvas.layered", "erase.content",
+                "ocr.optional", "bitmap.cached",
             ],
         }
 

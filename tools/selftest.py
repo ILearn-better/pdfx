@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import time
 import tempfile
 from pathlib import Path
 
@@ -182,12 +183,12 @@ def main() -> int:
         got = d.search(q)["total"]
         ok(f"OCR 检索「{q}」", got >= expect, f"{got} 处")
 
-    tgt = [l for l in d._page_lines(0) if "质保期" in l["text"]][0]
+    tgt = [l for l in d._page_lines(0, force_ocr=True) if "质保期" in l["text"]][0]
     up = d.update_text(0, tgt["id"], "质保期为 24 个月。")
     ok("改扫描件文字", d.search("24 个月")["total"] == 1 and d.search("12 个月")["total"] == 0, f"bbox={up['bbox']}")
     ok("改后仍能读原图内容", d.search("恒信")["total"] == 1)
 
-    t2 = [l for l in d._page_lines(0) if "签订日期" in l["text"]][0]
+    t2 = [l for l in d._page_lines(0, force_ocr=True) if "签订日期" in l["text"]][0]
     d.delete_text(0, t2["id"])
     ok("删扫描件文字", d.search("签订日期")["total"] == 0)
 
@@ -208,6 +209,47 @@ def main() -> int:
     d.undo()
     after = d.list_text(0)["count"]
     ok("撤销", after == before and mid > before, f"{before}→{mid}→{after}")
+    d.close()
+
+    section("删图后重新插入 / OCR 按需 / 渲染缓存")
+    d = fresh("samples/sample_text.pdf", "reinsert.pdf")
+    first = d.list_images(0)["items"][0]
+    d.delete_image(0, first["id"])
+    ok("删掉原生图片后对象列表为空", len(d.list_images(0)["items"]) == 0)
+    again = d.add_image(0, [80, 300, 240, 380], ROOT / "samples" / "logo.png", name="logo.png")
+    items = d.list_images(0)["items"]
+    ok("删掉之后还能再插入图片", len(items) == 1 and items[0]["source"] == "user",
+       f"{len(items)} 张, bbox={again['bbox']}")
+    # 记录里的 bbox 必须和图片真实落点一致，否则界面上"框住了但图在别处"
+    ok("新插入的图片 bbox 与实际渲染一致",
+       abs(again["bbox"][0] - 80) < 2 and abs(again["bbox"][2] - 240) < 2,
+       str([round(v, 1) for v in again["bbox"]]))
+    same_spot = d.add_image(0, [80, 300, 240, 380], ROOT / "samples" / "logo.png", name="again.png")
+    ok("同一位置重复插入不会丢图", len(d.list_images(0)["items"]) == 2,
+       f"bbox={[round(v, 1) for v in same_spot['bbox']]}")
+    d.close()
+
+    d = fresh("samples/sample_scan.pdf", "ocr_opt.pdf")
+    plain = d.list_text(0)
+    ok("扫描页默认不跑 OCR（浏览不再等 1~3 秒）", plain["count"] == 0, f"texts={plain['count']}")
+    forced = d.list_text(0, force_ocr=True)
+    ok("显式要求后才识别", forced["count"] >= 5, f"texts={forced['count']}")
+    ok("检索仍会自动识别扫描页", d.search("质保期")["total"] >= 1)
+    d.close()
+
+    d = fresh("samples/sample_text.pdf", "cache.pdf")
+    a = d.render(0, 96)
+    t0 = time.perf_counter()
+    b = d.render(0, 96)
+    fast = (time.perf_counter() - t0) * 1000
+    ok("同页同 dpi 的位图命中缓存", a == b and fast < 8, f"第二次 {fast:.1f} ms")
+    d.add_strokes(0, [{"points": [[40, 40], [90, 90]], "color": "#d64545", "width": 2}])
+    c = d.render(0, 96)
+    ok("内容一变缓存自动失效", c != a)
+    ok("笔迹撤销走轻量快照（不做整份 PDF 序列化）",
+       d._undo and d._undo[-1][0] == "ink", str(d._undo[-1][0]) if d._undo else "空")
+    d.undo()
+    ok("笔迹撤销后位图回到原样", d.render(0, 96) == a)
     d.close()
 
     section("异常处理")

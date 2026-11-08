@@ -633,6 +633,79 @@ async function main() {
   check('移动后原位没有图片残影', ghost.blue != null && ghost.total > 0 && ghost.blue / ghost.total < 0.02,
     ghost.err || `原位蓝色像素 ${ghost.blue} / ${ghost.total}（${(100 * ghost.blue / Math.max(1, ghost.total)).toFixed(1)}%）`);
 
+  // ---- 删除图片 → 还能不能再插回来 ----
+  // 曾经的死结：删除只是拿纸色块盖住，旧图仍留在内容流里；再往同一处插新图时，
+  // 按位置匹配会抓到那张旧图，记录里的 bbox 写成旧位置 —— 界面上就是"插不进来"。
+  console.log('\n== 删除图片 → 重新插入 ==');
+  const reinsert = await ev(`(async () => {
+    const doc = (await (await fetch('/api/docs')).json()).data.current;
+    const grab = async () => (await (await fetch('/api/image?page=0&doc=' + doc)).json())
+      .data.items.filter((x) => x.source === 'user');
+    const list0 = await grab();
+    if (!list0.length) return { err: '没有可删的图' };
+    const id = list0[list0.length - 1].id;
+    const del = await (await fetch('/api/image', {
+      method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ page: 0, id, mode: 'purge', doc }),
+    })).json();
+    if (!del.ok) return { err: '删除接口报错 ' + JSON.stringify(del.error) };
+    await new Promise((z) => setTimeout(z, 400));
+    return { before: list0.length, after: (await grab()).length, mode: del.data.mode };
+  })()`);
+  check('删除图片是真删（redaction），不是涂一块色块', reinsert.mode === 'purged',
+    String(reinsert.mode || reinsert.err));
+  check('删完之后对象列表里确实没有它了', reinsert.after === reinsert.before - 1,
+    `${reinsert.before} → ${reinsert.after}`);
+
+  const reinsertUi = await ev(`(async () => {
+    document.querySelector('[data-tool="image"]').click();
+    await new Promise((z) => setTimeout(z, 150));
+    const c = document.createElement('canvas');
+    c.width = 300; c.height = 200;
+    const g = c.getContext('2d');
+    g.fillStyle = '#12805c'; g.fillRect(0, 0, 300, 200);
+    const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+    const dt = new DataTransfer();
+    dt.items.add(new File([blob], 'after-delete.png', { type: 'image/png' }));
+    const el = document.querySelector('#img-input');
+    el.files = dt.files;
+    el.dispatchEvent(new Event('change'));
+    await new Promise((z) => setTimeout(z, 2600));
+    const doc = (await (await fetch('/api/docs')).json()).data.current;
+    const items = (await (await fetch('/api/image?page=0&doc=' + doc)).json())
+      .data.items.filter((x) => x.source === 'user');
+    const size = (await (await fetch('/api/doc?doc=' + doc)).json()).data.pages[0].size;
+    const last = items[items.length - 1];
+    const im = document.querySelector('#pages .pbox.current img');
+    let green = 0;
+    try {
+      await im.decode();
+      const cc = document.createElement('canvas');
+      cc.width = size[0]; cc.height = size[1];
+      const cx = cc.getContext('2d');
+      cx.drawImage(im, 0, 0, size[0], size[1]);
+      const b = last.bbox;
+      const w = Math.max(1, Math.round(b[2] - b[0]) - 10);
+      const h = Math.max(1, Math.round(b[3] - b[1]) - 10);
+      const d = cx.getImageData(Math.round(b[0]) + 5, Math.round(b[1]) + 5, w, h).data;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i] < 90 && d[i + 1] > 90 && d[i + 2] < 130) green++;
+      }
+    } catch (e) { /* 读不到像素就只靠 bbox 判断 */ }
+    return {
+      count: items.length,
+      bbox: last ? last.bbox.map(Math.round) : null,
+      inside: last ? last.bbox[0] >= 0 && last.bbox[1] >= 0
+        && last.bbox[2] <= size[0] + 1 && last.bbox[3] <= size[1] + 1 : false,
+      green,
+      toast: document.querySelector('#toast').textContent,
+    };
+  })()`);
+  check('删除之后用界面还能插进新图片', reinsertUi.count >= 1, reinsertUi.toast);
+  check('新图片的落点在页面范围内', reinsertUi.inside === true, JSON.stringify(reinsertUi.bbox));
+  check('新图片真的画进了页面位图', reinsertUi.green > 200, `${reinsertUi.green} 个绿色像素`);
+  await shot('image-reinserted');
+
   // ---- 三种浏览方式 ----
   console.log('\n== 浏览方式 ==');
   const singleBoxes = await ev(`document.querySelectorAll('#pages .pbox').length`);
@@ -767,6 +840,54 @@ async function main() {
   check('手指/手写笔拖动没有被浏览器判成滚动（无 pointercancel）', pc === 0, `pointercancel=${pc}`);
   check('触摸也能写下一整笔', touchStrokes1 === touchStrokes0 + 1, `笔迹 ${touchStrokes0} → ${touchStrokes1}`);
   await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: false });
+
+  // ---- 扫描件：OCR 不再自动跑 ----
+  // 以前只要页面是扫描件就自动识别，翻一页等 1~3 秒，连续模式下一路卡。
+  console.log('\n== OCR：改为按页手动触发 ==');
+  await ev(`(async () => {
+    await fetch('/api/open', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: 'samples/sample_scan.pdf' }) });
+    return true;
+  })()`);
+  await cdp.send('Page.reload');
+  await sleep(1500);
+  for (let i = 0; i < 60; i++) {
+    try {
+      if (await ev(`!!document.querySelector('#pages .pbox')`)) break;
+    } catch (e) { /* 导航中 evaluate 会短暂报错 */ }
+    await sleep(250);
+  }
+  const ocrBefore = await ev(`(() => {
+    const tags = [...document.querySelectorAll('#objlist .tag')].map((t) => t.textContent.trim());
+    return {
+      type: (document.querySelector('#page-type') || {}).textContent,
+      rows: document.querySelectorAll('#objlist .obj').length,
+      ocrTag: tags.filter((t) => t === 'ocr').length,
+      textRows: tags.filter((t) => t === 'ocr' || t === 'text' || t === 'mine').length,
+      tags,
+      btn: (document.querySelector('#btn-ocr') || {}).textContent,
+    };
+  })()`);
+  check('打开扫描件时不会自动 OCR（不用干等）', ocrBefore.ocrTag === 0 && ocrBefore.textRows === 0,
+    `对象 ${ocrBefore.rows} 行，标签 ${JSON.stringify(ocrBefore.tags)}`);
+  check('扫描件的类型标识仍然正确', String(ocrBefore.type).trim() === '扫描件', String(ocrBefore.type));
+  check('对象面板给出「识别本页」入口', /识别/.test(String(ocrBefore.btn)), String(ocrBefore.btn));
+
+  const ocrAfter = await ev(`(async () => {
+    document.querySelector('#btn-ocr').click();
+    for (let i = 0; i < 80; i++) {
+      await new Promise((z) => setTimeout(z, 250));
+      if (document.querySelectorAll('#objlist .tag.ocr').length > 0) break;
+    }
+    return {
+      ocrTag: document.querySelectorAll('#objlist .tag.ocr').length,
+      rows: document.querySelectorAll('#objlist .obj').length,
+      toast: (document.querySelector('#toast') || {}).textContent,
+    };
+  })()`);
+  check('点「识别本页」之后文字才出现', ocrAfter.ocrTag > 0,
+    `${ocrAfter.ocrTag} 行 OCR｜${ocrAfter.toast}`);
+  await shot('ocr-manual');
 
   console.log(`\n合计 ${pass} 项通过，${fail} 项失败`);
   if (errors.length) {

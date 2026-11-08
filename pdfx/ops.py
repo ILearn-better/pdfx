@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -209,6 +210,11 @@ class TextMixin:
         p = self.page(page_no)
         out: list[dict] = []
         try:
+            # get_text("dict") 在扫描页上要 60ms 左右（得把整页内容流解析成块结构），
+            # 而扫描页根本没有文字块。先用几乎免费的纯文本探测挡一道：
+            # 页面一个字都没有就直接返回，翻页/对象查询从 60ms+ 降到 1ms 以内。
+            if not p.get_text("text").strip():
+                return out
             data = p.get_text("dict")
         except Exception:
             return out
@@ -346,18 +352,25 @@ class TextMixin:
         except Exception:
             return 0.0
 
-    def _page_lines(self, page_no: int, force_ocr: bool = False, dpi: int = OCR_DPI) -> list[dict]:
+    def _page_lines(self, page_no: int, force_ocr: bool = False, dpi: int = OCR_DPI,
+                    auto_ocr: bool = False) -> list[dict]:
         """文本层 + OCR 结果的统一视图。
 
-        判定逻辑不再看"有没有文字"，而看"页面是否被位图主导"：
-        扫描页即使被插入了新文本（有了文本层），仍然需要 OCR 才能看到原图内容。
+        **浏览时 OCR 默认不跑**。以前只要页面被位图主导就自动识别，结果是翻到
+        任何一页扫描件都要等 1~3 秒（整页 200dpi 识别），连续模式下滚动翻页
+        一路卡到底 —— 而用户多数时候只是看图，并不需要文字层。
+
+        现在分三种场合：
+        - 界面浏览（默认）：只返回文本层，扫描页拿到空列表，界面提示"未识别"；
+        - 界面显式点「识别本页文字」：force_ocr=True；
+        - 检索 / 导出全文：auto_ocr=True —— 这是用户主动发起的动作，
+          扫描件必须识别，否则"搜不到东西"才是真问题。
+        识别结果按图像哈希缓存，同一页只算一次。
         """
-        page = self.page(page_no)
         native = self._merge_user_texts(page_no, self._native_lines(page_no))
-        cov = self._image_coverage(page)
-        need_ocr = force_ocr or cov >= 0.5 or (not native and bool(page.get_images()))
-        if not need_ocr:
-            return native
+        if not force_ocr:
+            if not auto_ocr or not self._needs_ocr(page_no, native):
+                return native
 
         try:
             ocr = self._ocr_lines(page_no, dpi)
@@ -377,6 +390,14 @@ class TextMixin:
         merged.sort(key=lambda l: (round(l["bbox"][1] / 4), l["bbox"][0]))
         return merged
 
+    def _needs_ocr(self, page_no: int, native: list[dict] | None = None) -> bool:
+        """这页有没有"只存在于图里"的内容（扫描件）。"""
+        lines = native if native is not None else self._native_lines(page_no)
+        page = self.page(page_no)
+        if self._image_coverage(page) >= 0.5:
+            return True
+        return not lines and bool(page.get_images())
+
     def list_text(self, page_no: int, force_ocr: bool = False, dpi: int = OCR_DPI) -> dict[str, Any]:
         lines = self._page_lines(page_no, force_ocr=force_ocr, dpi=dpi)
         return {
@@ -388,6 +409,12 @@ class TextMixin:
 
     # ---------------------------------------------------------------- 定位
     def _find_text(self, page_no: int, target: Any, force_ocr: bool = False, dpi: int = OCR_DPI) -> dict:
+        # 定位一个 OCR 行时当然得先跑识别，否则"用户点的是识别结果，后端却看不见它"
+        if not force_ocr:
+            if isinstance(target, dict):
+                force_ocr = target.get("source") == "ocr"
+            elif isinstance(target, str):
+                force_ocr = ":o" in target
         lines = self._page_lines(page_no, force_ocr=force_ocr, dpi=dpi)
         if isinstance(target, dict):
             bbox = norm_rect(target.get("bbox") or [])
@@ -673,7 +700,7 @@ class TextMixin:
             "created": time.time(),
         }
         self._pstate(page)["texts"].append(rec)
-        self._dirty = True
+        self._touch()
         # 同样返回副本：后续 update/transform 会原地改写内部记录
         return dict(rec)
 
@@ -759,7 +786,7 @@ class TextMixin:
                         "created": time.time(),
                     }
                 )
-        self._dirty = True
+        self._touch()
         return {"page": page_no, "bbox": used, "text": text, "replaced_source": src}
 
     def transform_text(
@@ -821,7 +848,7 @@ class TextMixin:
             if rec.get("id") == item.get("id"):
                 rec.update({"bbox": used, "font_size": size, "color": list(_as_rgb(ink))})
                 break
-        self._dirty = True
+        self._touch()
         return {"page": page_no, "bbox": used, "font_size": size, "source": src}
 
     # ---------------------------------------------------------------- 删
@@ -848,7 +875,7 @@ class TextMixin:
         before = len(st.get("texts", []))
         st["texts"] = [r for r in st.get("texts", []) if r["id"] not in ids]
         removed_user = before - len(st["texts"])
-        self._dirty = True
+        self._touch()
         return {
             "page": page_no,
             "deleted": len(found),
@@ -867,29 +894,44 @@ class ImageMixin:
         注意两点：
         1. 同一图像字节被 insert_image 复用时会共享 xref，所以 xref 不能当唯一键；
         2. 覆盖/重绘后同一位置可能出现重复的绘制指令，这里按 (xref, 位置) 去重。
+
+        get_image_info(xrefs=True) 在扫描页上约 40ms（要解析内容流并取图像元数据），
+        而它会被 list_images / _instance_near 反复调用 —— 翻页、拖图、插图的
+        每一帧都摊一次。按页面修订号缓存，内容没变就直接复用。
         """
-        out: list[dict] = []
-        seen: set[tuple] = set()
-        try:
-            infos = page.get_image_info(xrefs=True)
-        except Exception:
-            infos = []
-        for info in infos:
-            xref = int(info.get("xref") or 0)
-            bbox = _rect_list(fitz.Rect(info["bbox"]))
-            key = (xref,) + tuple(round(v, 1) for v in bbox)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(
-                {
-                    "xref": xref,
-                    "bbox": bbox,
-                    "pixel_width": int(info.get("width") or 0),
-                    "pixel_height": int(info.get("height") or 0),
-                }
-            )
-        return out
+        key = ("imginst", page.number, self._rev)
+
+        def build() -> list[dict]:
+            out: list[dict] = []
+            seen: set[tuple] = set()
+            # 只能用 get_image_info(xrefs=True)：
+            # get_images + get_image_rects 看着更快，但它按"图像资源"返回所有绘制位置 ——
+            # 同一份图像字节被复用时（比如插入的图和页面原有的图恰好同源），
+            # PyMuPDF 会把两个引用指向同一个 xref，于是每个 xref 都返回全部矩形，
+            # 拼出来的实例列表既重复又张冠李戴（一张图被算成两处）。
+            try:
+                infos = page.get_image_info(xrefs=True)
+            except Exception:
+                infos = []
+            for info in infos:
+                xref = int(info.get("xref") or 0)
+                bbox = _rect_list(fitz.Rect(info["bbox"]))
+                k = (xref,) + tuple(round(v, 1) for v in bbox)
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(
+                    {
+                        "xref": xref,
+                        "bbox": bbox,
+                        "pixel_width": int(info.get("width") or 0),
+                        "pixel_height": int(info.get("height") or 0),
+                    }
+                )
+            return out
+
+        return self._cached(key, build)
+
 
     def list_images(self, page_no: int) -> dict[str, Any]:
         page = self.page(page_no)
@@ -988,6 +1030,7 @@ class ImageMixin:
             xref = page.insert_image(r, stream=data, keep_proportion=bool(keep_ratio), rotate=int(rotate) % 360, overlay=True)
         except Exception as exc:
             raise PdfxError(f"插入图片失败: {exc}", "image_insert_failed")
+        self._bump()   # 内容流变了，下面按位置回查实例必须看新的
         taken = [rec["bbox"] for rec in self._pstate(page).get("images", [])]
         bbox = self._instance_near(page, r, taken=taken)
         rec = {
@@ -998,7 +1041,7 @@ class ImageMixin:
             "created": time.time(),
         }
         self._pstate(page)["images"].append(rec)
-        self._dirty = True
+        self._touch()
         # 返回副本：这份记录后续会被 transform / replace 原地更新，
         # 直接把内部 dict 交出去的话，调用方拿到的"插入时 bbox"会自己变掉
         return dict(rec)
@@ -1007,43 +1050,60 @@ class ImageMixin:
         items = self.list_images(page_no)["items"]
         item = self._pick_image(items, target)
         data = self._read_binary(src)
-        self._push_undo()
         page = self.page(page_no)
+        self._push_undo()
 
-        # 一律用纸色块盖住旧图再重绘。不要按 xref 删：
-        # 相同字节的图片会共享 xref，删一次会连页面原有的图一起带走。
-        # 颜色必须取"页面纸张底色"而不是 _bg_color（区域边缘众数色）——
-        # 那块区域整个就是旧图自己，取出来是图片的颜色，等于用图盖图：
-        # 当下看着正常（新图压在上面），但日后这层色块会变成一模一样的残影。
+        # 和删除 / 移动一样：redaction 真删旧图，别涂色块盖住。
+        # 涂色的后果是旧图仍在内容流里，之后任何"按位置找实例"的操作都可能抓到它，
+        # 记录里的 bbox 就会被写成旧图的位置。
         old = _rect_list(fitz.Rect(*item["bbox"]))
-        self._cover(page, old, color=self._paper_color(page))
-        if item["source"] == "user":
-            self._suppress(page, old)  # 用户图重绘在别处时，旧实例也要从列表里退场
+        try:
+            page.add_redact_annot(fitz.Rect(*old))
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_REMOVE,
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                text=fitz.PDF_REDACT_TEXT_NONE,
+            )
+        except Exception:
+            self._cover(page, old, color=self._paper_color(page))
+            if item["source"] == "user":
+                self._suppress(page, old)  # 用户图重绘在别处时，旧实例也要从列表里退场
+        self._bump()
         r = fitz.Rect(*old)
         try:
             xref = page.insert_image(r, stream=data, keep_proportion=bool(keep_ratio), overlay=True)
         except Exception as exc:
             raise PdfxError(f"替换图片失败: {exc}", "image_insert_failed")
-        taken = [rec["bbox"] for rec in self._pstate(page).get("images", []) if rec["id"] != item["id"]]
+        self._bump()
+        st = self._pstate(page)
+        taken = [rec["bbox"] for rec in st.get("images", []) if rec["id"] != item["id"]]
         bbox = self._instance_near(page, r, taken=taken)
 
-        st = self._pstate(page)
         for rec in st.get("images", []):
             if rec["id"] == item["id"]:
                 rec.update({"bbox": bbox, "xref": xref})
                 break
-        self._dirty = True
+        if st.get("strokes"):
+            self._rebuild_inks(page, st["strokes"])
+        self._touch()
         return {"page": page_no, "id": item["id"], "bbox": bbox, "old_source": item["source"]}
 
-    def delete_image(self, page_no: int, target: Any, mode: str = "cover") -> dict[str, Any]:
+    def delete_image(self, page_no: int, target: Any, mode: str = "purge") -> dict[str, Any]:
+        """删掉一张图。
+
+        默认 purge：用 redaction 把这块区域的图像从内容流里真正移除 ——
+        不留下任何"被白块盖着的原图"。这一点很关键：以前默认涂一块纸色，
+        图还在下面，之后往同一位置插新图时，`get_image_info` 依然能列出那张
+        旧图，按位置匹配就会把新记录的 bbox 写成旧图的位置，界面上表现为
+        "删掉图片以后再也插不进来 / 插了看不见"。真删之后这条路就干净了。
+        """
         items = self.list_images(page_no)["items"]
         item = self._pick_image(items, target)
-        self._push_undo()
         page = self.page(page_no)
-        done = "cover"
+        self._push_undo()
         rect = _rect_list(fitz.Rect(*item["bbox"]))
-
-        if mode == "purge":
+        done = "purged"
+        if mode != "cover":
             try:
                 page.add_redact_annot(fitz.Rect(*rect))
                 page.apply_redactions(
@@ -1051,19 +1111,35 @@ class ImageMixin:
                     graphics=fitz.PDF_REDACT_LINE_ART_NONE,
                     text=fitz.PDF_REDACT_TEXT_NONE,
                 )
-                done = "purged"
             except Exception:
                 self._cover(page, rect, color=self._paper_color(page))
+                done = "cover"
         else:
-            # 同样要用纸色：这块区域就是图片本身，取局部边缘色等于把图涂回原位
+            # 显式要求"只盖掉"时才走涂色（比如用户想保留底层内容做底稿）
             self._cover(page, rect, color=self._paper_color(page))
+            done = "cover"
+        self._bump()   # 内容流已改，后面的读取不能再用写之前的实例列表
 
         st = self._pstate(page)
         st["images"] = [r for r in st.get("images", []) if r["id"] != item["id"]]
+        # 同一位置的历史"已遮住"记录一并清掉，否则日后往这儿插新图会被它判成隐藏
+        keep_hidden = []
+        for h in st.get("hidden_images", []):
+            hb = h.get("bbox") or []
+            if len(hb) == 4 and iou(hb, rect) > 0.6:
+                continue
+            keep_hidden.append(h)
+        if keep_hidden:
+            st["hidden_images"] = keep_hidden
+        else:
+            st.pop("hidden_images", None)
         if done == "cover":
             # 只是视觉覆盖，记下来避免它继续出现在对象列表里
             self._suppress(page, rect)
-        self._dirty = True
+        # redaction 会连带吃掉区域内的 ink 注释，已提交的笔迹按状态重建
+        if st.get("strokes"):
+            self._rebuild_inks(page, st["strokes"])
+        self._touch()
         return {"page": page_no, "id": item["id"], "mode": done}
 
     def transform_image(self, page_no: int, target: Any, rect: Any, keep_ratio: bool = True) -> dict[str, Any]:
@@ -1139,7 +1215,7 @@ class ImageMixin:
             if rec["id"] == item["id"]:
                 rec.update({"bbox": bbox, "xref": xref})
                 break
-        self._dirty = True
+        self._touch()
         return {"page": page_no, "id": item["id"], "bbox": bbox}
 
     def _pick_image(self, items: list[dict], target: Any) -> dict:
@@ -1219,7 +1295,11 @@ class InkMixin:
                 if len(pts) == 1:
                     x, y = float(pts[0][0]), float(pts[0][1])
                     pts = [[x, y], [x + 0.6, y + 0.6]]
-                path = [fitz.Point(float(p[0]), float(p[1])) for p in pts]
+                # 必须是"数值对"而不是 Point 对象：add_ink_annot 只认
+                # seq of seq of float pairs，传 Point 会抛 ValueError 然后
+                # 悄悄退化成本页矢量线条 —— 矢量画上去就删不掉了，
+                # 撤销时会发现笔迹纹丝不动、重建一次还叠一层。
+                path = [[float(p[0]), float(p[1])] for p in pts]
                 annot = page.add_ink_annot([path])
                 annot.set_colors(stroke=color)
                 annot.set_border(width=max(0.3, width))
@@ -1227,7 +1307,7 @@ class InkMixin:
                 annot.set_info(title=f"{INK_PREFIX}:{s['id']}", content=s["id"])
                 annot.update()
             except Exception:
-                # 注释失败则退化为矢量绘制
+                # 注释失败则退化为矢量绘制（此时撤销无法还原这几笔，但至少画得出来）
                 try:
                     page.draw_polyline(
                         [fitz.Point(float(p[0]), float(p[1])) for p in pts],
@@ -1243,9 +1323,11 @@ class InkMixin:
     def add_strokes(self, page_no: int, strokes: list[dict]) -> dict[str, Any]:
         if not strokes:
             raise PdfxError("没有笔画数据", "empty_strokes")
-        self._push_undo()
         page = self.page(page_no)
         st = self._pstate(page)
+        # 笔迹撤销不拍整份 PDF 快照：扫描件动辄几十 MB，序列化一次就是几百毫秒，
+        # 落在"每写一笔"上就是肉眼可见的卡。只记改动前的笔迹数组，撤销时重建。
+        self._push_undo(("ink", page.xref, copy.deepcopy(st.get("strokes", []))))
         added = []
         for s in strokes:
             pts = [[float(p[0]), float(p[1])] for p in (s.get("points") or []) if len(p) >= 2]
@@ -1264,7 +1346,7 @@ class InkMixin:
             raise PdfxError("笔画数据无效（点太少）", "empty_strokes")
         st["flattened"] = False
         self._rebuild_inks(page, st["strokes"])
-        self._dirty = True
+        self._touch()
         return {"page": page_no, "added": len(added), "ids": [a["id"] for a in added], "total": len(st["strokes"])}
 
     def erase_strokes(
@@ -1289,7 +1371,7 @@ class InkMixin:
         if not strokes:
             return {"page": page_no, "removed": 0, "kept": 0, "split": 0}
 
-        self._push_undo()
+        self._push_undo(("ink", page.xref, copy.deepcopy(strokes)))
         eraser_pts = [[float(p[0]), float(p[1])] for p in (points or []) if len(p) >= 2]
         box = norm_rect(bbox) if bbox else None
         keep: list[dict] = []
@@ -1335,7 +1417,7 @@ class InkMixin:
 
         st["strokes"] = keep
         self._rebuild_inks(page, keep)
-        self._dirty = True
+        self._touch()
         return {
             "page": page_no,
             "removed": removed,
@@ -1353,7 +1435,7 @@ class InkMixin:
             n += len(st.get("strokes", []))
             st["strokes"] = []
             self._rebuild_inks(self.page(i), [])
-        self._dirty = True
+        self._touch()
         return {"cleared": n}
 
     def erase_area(
@@ -1447,7 +1529,7 @@ class InkMixin:
         # 3) 覆盖区内的笔迹也跟着断开（否则重新 _rebuild_inks 会把它画回来）
         ink = self.erase_strokes(page_no, points=pts or None,
                                  bbox=None if pts else union, radius=radius, mode="cut") if pts else {"removed": 0}
-        self._dirty = True
+        self._touch()
         return {
             "page": page_no,
             "removed_text": [t for t in removed_text if t][:20],
@@ -1485,7 +1567,7 @@ class InkMixin:
             st["flattened"] = True
             self._rebuild_inks(page, [])
         if n:
-            self._dirty = True
+            self._touch()
         return n
 
 
@@ -1616,7 +1698,7 @@ class SearchMixin:
         for pno in targets:
             ptype = self.page_type(pno)
             try:
-                lines = self._page_lines(pno, force_ocr=force_ocr, dpi=dpi)
+                lines = self._page_lines(pno, force_ocr=force_ocr, dpi=dpi, auto_ocr=True)
                 if force_ocr or ptype == "scanned":
                     ocr_pages.append(pno)
                 elif any(l["source"] == "ocr" for l in lines):
@@ -1649,7 +1731,7 @@ class SearchMixin:
         for pno in targets:
             ptype = self.page_type(pno)
             try:
-                lines = self._page_lines(pno, force_ocr=force_ocr, dpi=dpi)
+                lines = self._page_lines(pno, force_ocr=force_ocr, dpi=dpi, auto_ocr=True)
                 if force_ocr or ptype == "scanned" or any(l["source"] == "ocr" for l in lines):
                     ocr_pages.append(pno)
             except PdfxError:

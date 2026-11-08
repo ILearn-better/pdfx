@@ -80,6 +80,13 @@ def check(name: str, cond: bool, extra: str = "") -> bool:
     return cond
 
 
+def _head(path: str):
+    """拿响应头和响应体，用来断言缓存策略。"""
+    req = urllib.request.Request(BASE + path)
+    with _opener.open(req, timeout=60) as resp:
+        return resp.read(), dict(resp.headers)
+
+
 def main() -> int:
     ok_all = True
     spawned = ensure_server()
@@ -110,6 +117,20 @@ def main() -> int:
 
     png = call("/api/page/0.png?dpi=80", raw=True)
     ok_all &= check("GET /api/page/0.png", png[:4] == b"\x89PNG" and len(png) > 5000, f"{len(png)} bytes")
+
+    # 缓存策略：位图可以长期缓存（URL 带 rev），JSON 接口必须实时
+    _, png_hdr = _head("/api/page/0.png?dpi=80")
+    ok_all &= check("页面位图允许浏览器缓存", "max-age=" in (png_hdr.get("Cache-Control") or ""),
+                    str(png_hdr.get("Cache-Control")))
+    _, json_hdr = _head("/api/doc")
+    ok_all &= check("JSON 接口不缓存", "no-store" in (json_hdr.get("Cache-Control") or ""),
+                    str(json_hdr.get("Cache-Control")))
+
+    # 同参数位图第二次应该走后端内存缓存（第一次 40~80ms，这时应 < 15ms）
+    t0 = time.perf_counter()
+    call("/api/page/0.png?dpi=80", raw=True)
+    warm = (time.perf_counter() - t0) * 1000
+    ok_all &= check("重复请求同一张位图命中缓存", warm < 25, f"第二次 {warm:.1f} ms")
 
     thumb = call("/api/page/0/thumb.png?w=120", raw=True)
     ok_all &= check("GET thumb.png", thumb[:4] == b"\x89PNG")

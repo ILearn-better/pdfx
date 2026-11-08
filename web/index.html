@@ -74,7 +74,7 @@
 </header>
 
 <div class="stale-bar" id="stale-bar" hidden>
-  <b>服务端还是旧版本</b>，这次更新（橡皮擦页面内容、拖动缩放等）不会生效。
+  <b>服务端还是旧版本</b>，这次的改动（OCR 手动触发、位图缓存、图片删除修复）不会生效。
   请关掉启动脚本的黑色窗口，重新双击 <code>启动PDF工具.bat</code>（会问是否换新版本），再刷新本页。
 </div>
 
@@ -126,7 +126,7 @@
     <div class="tabpane active" id="pane-objects">
       <div class="pane-head">
         <span id="page-type" class="pill">—</span>
-        <label class="chk"><input type="checkbox" id="obj-ocr" /> 含OCR</label>
+        <button class="btn small ghost" id="btn-ocr" title="识别本页文字（扫描件才需要，约 1~3 秒）">识别本页</button>
       </div>
       <div class="objlist" id="objlist"></div>
     </div>

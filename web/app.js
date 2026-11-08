@@ -35,7 +35,9 @@
     pan: null,
     pendingImage: null,
     busy: false,
-    version: 0,           // 内容版本号，用于图片缓存失效
+    rev: 1,               // 后端文档修订号：内容一变就变，位图 URL 用它做缓存键
+    sid: '',              // 后端进程标识：重启后换掉，避免拿到上次进程的缓存位图
+    ocrPages: new Set(),  // 已经手动识别过文字的页（不再自动 OCR）
     brush: { color: '#d64545', width: 2.2 },
     eraser: { radius: 10, scope: 'all' },   // all=笔迹+页面原有内容；ink=只擦自己画的笔迹
     textStyle: { size: 12, color: '#111111' },
@@ -76,6 +78,12 @@
       const err = new Error((data.error && data.error.message) || '操作失败');
       err.code = data.error && data.error.code;
       throw err;
+    }
+    // 每个响应都带着后端修订号：拿到就更新，位图 URL 立刻跟着变，
+    // 不用等下一次 refreshObjects 才知道内容已经改了。
+    if (data.data && typeof data.data === 'object') {
+      if (typeof data.data.rev === 'number') S.rev = Math.max(S.rev, data.data.rev);
+      if (data.data.sid) S.sid = data.data.sid;
     }
     return data.data;
   }
@@ -160,7 +168,28 @@
     return new Promise((resolve) => {
       const el = $(map[which] || '#file-input');
       el.value = '';
-      el.onchange = () => resolve(el.files[0] || null);
+      let done = false;
+      let timer = 0;
+      const finish = (f) => {
+        if (done) return;
+        done = true;
+        el.onchange = null;
+        window.removeEventListener('focus', onFocus);
+        clearTimeout(timer);
+        resolve(f);
+      };
+      /* 用户在系统文件框里点「取消」时浏览器不发 change 事件。
+         以前这里只认 change，取消一次这个 Promise 就永远悬着（后续再点
+         「图片」也不会有任何反应）—— 看起来就是"插入图片坏了"。
+         窗口重新获得焦点是取消的唯一可靠信号，再留一个超时兜底。 */
+      function onFocus() {
+        setTimeout(() => {
+          if (!el.files || !el.files.length) finish(null);
+        }, 500);
+      }
+      el.onchange = () => finish(el.files[0] || null);
+      window.addEventListener('focus', onFocus);
+      timer = setTimeout(() => finish(el.files && el.files[0] ? el.files[0] : null), 60000);
       el.click();
     });
   }
@@ -185,8 +214,12 @@
   }
 
   function pageSrc(i) {
-    const dpi = Math.max(60, Math.round(96 * S.zoom));
-    return `/api/page/${i}.png?dpi=${dpi}&doc=${S.doc}&v=${S.version}`;
+    // dpi 跟着缩放走；上限 192，再往上单页渲染要 200ms+，画面糊一点比卡住好。
+    const dpi = Math.max(60, Math.min(192, Math.round(96 * S.zoom)));
+    // s=进程标识、r=修订号：内容一变 URL 就变，可以放心让浏览器长期缓存位图。
+    // 以前没有这两个键、后端还把位图也设成 no-store，于是每放大一次就把所有页
+    // 重新渲染一遍 —— 这是"整体卡顿"最直接的一环。
+    return `/api/page/${i}.png?dpi=${dpi}&doc=${S.doc}&s=${S.sid}&r=${S.rev}`;
   }
 
   function renderEmpty() {
@@ -267,7 +300,6 @@
     im.src = im.dataset.src;
     box.dataset.loaded = '1';
   }
-
   function currentBox() {
     return pagesBox.querySelector(`.pbox[data-page="${S.page}"]`);
   }
@@ -342,12 +374,36 @@
     $$('#thumbs .thumb-wrap').forEach((t) => t.classList.toggle('active', +t.dataset.page === S.page));
   }
 
+  /* 缩略图懒请求：一百页的文档如果一上来就发一百个请求，后端要串行渲染一百次，
+     期间点任何东西都得排队 —— 这是"打开大文件后整个界面卡住"的来源。
+     只渲染滚动到可见区域附近的那十几张。 */
+  const thumbIO = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((e) => {
+        if (!e.isIntersecting) return;
+        const im = e.target.querySelector('img');
+        if (im && im.dataset.src && im.src !== im.dataset.src) {
+          im.src = im.dataset.src;
+          delete im.dataset.src;
+        }
+        thumbIO.unobserve(e.target);
+      });
+    },
+    { root: $('#thumbs'), rootMargin: '400px 0px' }
+  );
+
+  function thumbSrc(i) {
+    return `/api/page/${i}/thumb.png?w=150&doc=${S.doc}&s=${S.sid}&r=${S.rev}`;
+  }
+
   function renderThumbs() {
     const box = $('#thumbs');
+    thumbIO.disconnect();
     box.innerHTML = '';
     $('#page-count').textContent = String(S.pageCount);
     $('#page-now').textContent = String(S.pageCount ? S.page + 1 : 0);
     if (!S.doc || !S.pageCount) return;
+    const frag = document.createDocumentFragment();
     for (let i = 0; i < S.pageCount; i++) {
       const w = document.createElement('div');
       w.className = 'thumb-wrap' + (i === S.page ? ' active' : '');
@@ -355,19 +411,32 @@
       const b = document.createElement('button');
       b.className = 'thumb';
       b.title = `第 ${i + 1} 页`;
-      b.innerHTML = `<img src="/api/page/${i}/thumb.png?w=150&doc=${S.doc}&v=${S.version}" alt="" loading="lazy" />`;
+      const im = document.createElement('img');
+      im.alt = '';
+      im.dataset.src = thumbSrc(i);
+      b.appendChild(im);
       b.onclick = () => setCurrentPage(i, { scroll: true });
       const num = document.createElement('div');
       num.className = 'num';
       num.textContent = String(i + 1);
       w.append(b, num);
-      box.appendChild(w);
+      frag.appendChild(w);
     }
+    box.appendChild(frag);
+    $$('#thumbs .thumb-wrap').forEach((w) => thumbIO.observe(w));
+    // 当前页附近的缩略图立刻要（否则首屏一片空白）
+    const near = [S.page, S.page - 1, S.page + 1, S.page + 2].filter((i) => i >= 0 && i < S.pageCount);
+    near.forEach((i) => {
+      const im = box.querySelector(`.thumb-wrap[data-page="${i}"] img`);
+      if (im && im.dataset.src) { im.src = im.dataset.src; delete im.dataset.src; }
+    });
   }
 
   function reloadThumb(i) {
     const im = $(`#thumbs .thumb-wrap[data-page="${i}"] img`);
-    if (im) im.src = `/api/page/${i}/thumb.png?w=150&doc=${S.doc}&v=${S.version}`;
+    if (!im) return;
+    im.src = thumbSrc(i);
+    delete im.dataset.src;
   }
 
   /* ------------------------------------------------------------------ 文档栏 */
@@ -412,6 +481,12 @@
   async function loadInfo(info) {
     S.doc = info.doc_id || info.doc || S.doc;
     S.path = info.path || null;
+    // 换文档时修订号必须归零重来：rev 是"每份文档各自"的计数，
+    // 沿用上一个文档的大值会让新文档的内容变化不对 URL 生效，
+    // 页面就一直显示缓存的旧图（橡皮擦完看着像没擦）。
+    S.rev = 0;
+    if (typeof info.rev === 'number') S.rev = Math.max(S.rev, info.rev);
+    if (info.sid) S.sid = info.sid;
     if (!info.pages) {
       try { info = await api('/api/doc'); S.path = info.path || null; } catch (e) { /* ignore */ }
     }
@@ -420,11 +495,11 @@
     S.page = 0;
     S.sel = null;
     S.hits = [];
-    S.version++;
+    S.ocrPages = new Set();   // OCR 结果按页记，换文档就清空
     syncStageClass();
     // 先列文档（左侧栏先有内容），再渲染页面，观感上不会"空一下"
     await refreshDocList();
-    await renderThumbs();
+    renderThumbs();
     renderPages();
     await refreshObjects();
     renderProps();
@@ -446,10 +521,16 @@
   }
 
   /* ------------------------------------------------------------------ 对象与叠加层 */
+  function wantOcr() {
+    // 只有用户手动点过「识别本页」的页才带 OCR 参数。
+    // 以前是"扫描页自动识别"，翻一页等 1~3 秒，连续模式下一路卡。
+    return S.forceOcr || S.ocrPages.has(S.page);
+  }
+
   async function refreshObjects() {
     if (!S.doc) return;
     try {
-      const objs = await api(`/api/page/${S.page}/objects?ocr=${S.forceOcr ? 1 : 0}`);
+      const objs = await api(`/api/page/${S.page}/objects?ocr=${wantOcr() ? 1 : 0}`);
       S.objs = { texts: objs.texts.items, images: objs.images.items, strokes: objs.strokes.items };
       S.size = objs.size;
       S.sizes[S.page] = objs.size;
@@ -457,11 +538,52 @@
       $('#page-type').textContent = { text: '结构化文本', scanned: '扫描件', mixed: '混合', empty: '空白页' }[objs.type] || objs.type;
       // 注意类名要加前缀：直接写 'pill empty' 会和页面上的空状态遮罩 .empty 撞名
       $('#page-type').className = 'pill t-' + objs.type;
+      syncOcrButton();
       drawOverlay();
       renderObjList();
       if (S.hits.length) renderResults();
     } catch (e) {
       toast(e.message, 'err');
+    }
+  }
+
+  function syncOcrButton() {
+    const b = $('#btn-ocr');
+    if (!b) return;
+    const done = S.ocrPages.has(S.page);
+    b.textContent = done ? '重新识别' : '识别本页';
+    // 结构化页本来就有文字层，不需要识别，别让按钮显得"点了没反应"
+    const useful = S.type === 'scanned' || S.type === 'mixed';
+    b.disabled = false;
+    b.title = useful
+      ? (done ? '这一页已经识别过，点一下可强制重新识别' : '扫描件没有文字层，识别后文字才能被选中、检索')
+      : '这一页本身就有文字层，不需要 OCR；点了会额外识别一次，用来校对图文是否一致';
+  }
+
+  /* 手动 OCR：只对当前页，结果由后端按图像哈希缓存，翻回来不用再等 */
+  async function doOcrPage() {
+    if (!S.doc) return;
+    if (S.type !== 'scanned' && S.type !== 'mixed') {
+      toast('这一页已有文字层，直接选中即可；如需校对可再点一次', '');
+    }
+    const btn = $('#btn-ocr');
+    const old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '识别中…';
+    const was = S.forceOcr;
+    S.forceOcr = true;
+    try {
+      await refreshObjects();
+      S.ocrPages.add(S.page);
+      const n = S.objs.texts.filter((t) => t.source === 'ocr').length;
+      toast(n ? `已识别 ${n} 行文字` : '这一页没识别出文字（可能是空白页或图像质量太低）', n ? 'ok' : '');
+    } catch (e) {
+      toast(e.message, 'err');
+    } finally {
+      S.forceOcr = was;
+      btn.disabled = false;
+      syncOcrButton();
+      if (btn.textContent === '识别中…') btn.textContent = old;
     }
   }
 
@@ -901,14 +1023,16 @@
     return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
   }
 
-  /* 内容变了：刷新对象 + 缩略图，页面位图按需更新 */
+  /* 内容变了：刷新对象 + 缩略图，页面位图按需更新。
+     顺序很关键 —— 先把新位图的请求发出去（URL 里的 rev 已由写接口的响应更新），
+     再等对象列表回来。反过来做的话，位图要等 JSON 往返完才开始下载，
+     一次拖动提交就白等一个来回。 */
   async function afterContentChange(opts = {}) {
     const { pageImage = true } = opts;
-    S.version++;
-    await refreshObjects();
     reloadThumb(S.page);
     if (pageImage) reloadPageImage(S.page);
-    renderDocList();
+    requestAnimationFrame(renderDocList);
+    await refreshObjects();
   }
 
   async function applyTextEdit(o) {
@@ -1559,7 +1683,6 @@
     if (!S.doc) return toast('先打开或新建一个文档', 'err');
     try {
       const r = await api('/api/page', { json: { page: S.page, size: 'a4', at: S.page + 1 } });
-      S.version++;
       S.pageCount = r.page_count;
       S.sizes = (r.pages || []).map((p) => p.size || S.size);
       await renderThumbs();
@@ -1581,7 +1704,6 @@
     if (!okDel) return;
     try {
       const r = await api('/api/page', { method: 'DELETE', json: { pages: S.page } });
-      S.version++;
       S.pageCount = r.page_count;
       S.sizes = (r.pages || []).map((p) => p.size || S.size);
       await renderThumbs();
@@ -1688,7 +1810,6 @@
           at: atMap[ask.at] === null ? null : atMap[ask.at],
         },
       });
-      S.version++;
       S.pageCount = r.page_count;
       S.sizes = (r.pages || []).map((p) => p.size || S.size);
       await renderThumbs();
@@ -1790,7 +1911,6 @@
     try {
       const r = await api('/api/undo', { json: {} });
       if (!r.undone) return toast('没有可撤销的操作', 'err');
-      S.version++;
       S.pageCount = r.page_count;
       S.sizes = (r.pages || []).map((p) => p.size || S.size);
       S.sel = null;
@@ -1879,13 +1999,43 @@
     $('#btn-showtext').classList.toggle('active', S.showText);
     drawOverlay();
   };
-  $('#obj-ocr').onchange = (e) => { S.forceOcr = e.target.checked; refreshObjects(); };
+  $('#btn-ocr').onclick = () => doOcrPage();
+  // 检索时扫描件必须识别（用户主动发起，等得起），这个开关只管检索
+  const ocrChk = $('#obj-ocr');
+  if (ocrChk) ocrChk.onchange = (e) => { S.forceOcr = e.target.checked; };
 
   /* ------------------------------------------------------------------ 缩放 */
+  /* 缩放时先只改盒子尺寸（立刻跟手），位图换高清版本防抖 160ms 再做。
+     原来每次滚轮/点按都重建整个 DOM + 重新请求全部位图，连续缩放就是灾难。 */
+  function applyZoomLayout() {
+    const k = pxPerPt();
+    pagesBox.querySelectorAll('.pbox').forEach((box) => {
+      const i = +box.dataset.page;
+      const [w, h] = sizeOf(i);
+      box.style.width = Math.max(1, Math.round(w * k)) + 'px';
+      box.style.height = Math.max(1, Math.round(h * k)) + 'px';
+    });
+    drawOverlay();
+  }
+
+  let zoomTimer = 0;
   function setZoom(z) {
-    S.zoom = Math.max(0.3, Math.min(3, z));
+    const next = Math.max(0.3, Math.min(3, Math.round(z * 100) / 100));
+    if (next === S.zoom) return;
+    S.zoom = next;
     $('#zoom-label').textContent = Math.round(S.zoom * 100) + '%';
-    if (S.doc) renderPages();
+    if (!S.doc) return;
+    applyZoomLayout();
+    clearTimeout(zoomTimer);
+    zoomTimer = setTimeout(() => {
+      if (!S.doc) return;
+      // 单页模式重排也没多少 DOM；连续/横向模式只换位图，不重建列表
+      if (S.view === 'single') renderPages();
+      else {
+        pagesBox.querySelectorAll('.pbox').forEach((box) => reloadPageImage(+box.dataset.page));
+      }
+      drawOverlay();
+    }, 160);
   }
   $('#zoom-in').onclick = () => setZoom(S.zoom + 0.15);
   $('#zoom-out').onclick = () => setZoom(S.zoom - 0.15);
@@ -1937,7 +2087,7 @@
       const j = await r.json();
       const caps = (j && j.data && j.data.caps) || [];
       // 缺任何一项新能力都算旧服务端：新前端会调到它没有的接口，用户只会觉得"点了没反应"
-      const need = ['text.transform', 'canvas.layered', 'erase.content'];
+      const need = ['text.transform', 'canvas.layered', 'erase.content', 'ocr.optional', 'bitmap.cached'];
       if (!j.ok || need.some((k) => !caps.includes(k))) {
         throw new Error('stale');
       }

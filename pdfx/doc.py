@@ -26,10 +26,12 @@ import io
 import json
 import os
 import re
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import pymupdf as fitz
 
@@ -55,7 +57,10 @@ from .util import (
 STATE_KEY = "PDFXState"
 INK_PREFIX = "pdfx-ink"
 OCR_DPI = 200
-UNDO_DEPTH = 12
+UNDO_DEPTH = 8
+# 位图 / 对象列表的缓存条数。一张 96dpi 的 A4 位图约 89KB，
+# 48 张约 4MB，换来的是「同一页同一缩放不重复渲染」。
+RENDER_CACHE = 48
 
 
 # --------------------------------------------------------------------------- 小工具
@@ -75,8 +80,16 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
     ) -> None:
         self.path: Path | None = Path(path).expanduser().resolve() if path else None
         self.state: dict[str, Any] = {"version": 1, "pages": {}}
-        self._undo: list[tuple[bytes, dict]] = []
+        self._undo: list[tuple] = []
         self._dirty = False
+        # 内容修订号：任何写操作都 +1，缓存键带上它，写入即自然失效。
+        # 没有这个的话只能靠"改完手动清缓存"，漏一处就会读到旧位图/旧对象列表。
+        self._rev = 1
+        # 每份文档一把锁。渲染是 CPU 密集的，不能因为别的文档在渲染就把
+        # 这份文档的接口全堵住（原来是全站一把锁，多文档同时用会互相等待）。
+        self.lock = threading.RLock()
+        self._cache: "OrderedDict[tuple, Any]" = OrderedDict()
+        self._cache_cap = RENDER_CACHE
 
         if self.path:
             if not self.path.exists():
@@ -102,6 +115,43 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
             self.doc.close()
         except Exception:
             pass
+        self._cache.clear()
+
+    # ------------------------------------------------------------------ 缓存
+    def _bump(self) -> None:
+        """内容变了：修订号 +1 并丢掉所有派生缓存。"""
+        self._rev += 1
+        self._cache.clear()
+
+    def _touch(self) -> None:
+        """写操作收尾：标记未保存 + 让所有派生缓存失效。
+
+        必须放在"写完"之后而不是之前 —— 写的过程中还会读同一页的图片实例、
+        页面类型等（比如删图要按 bbox 定位），提前清缓存会让这些读取
+        重新计算一遍旧内容，既慢又容易把过期结果存回缓存。
+        """
+        self._dirty = True
+        self._bump()
+
+    @property
+    def rev(self) -> int:
+        return self._rev
+
+    def _cached(self, key: tuple, build: Callable[[], Any]) -> Any:
+        """按修订号缓存的派生结果（位图、缩略图、图片实例列表）。
+
+        这些都是"算一次几十毫秒"的东西，而界面会在翻页、拖动出图、
+        缩略图刷新时反复要同一份 —— 不缓存的话每次都要重新渲染一遍。
+        """
+        hit = self._cache.get(key)
+        if hit is not None:
+            self._cache.move_to_end(key)
+            return hit
+        val = build()
+        self._cache[key] = val
+        while len(self._cache) > self._cache_cap:
+            self._cache.popitem(last=False)
+        return val
 
     def __enter__(self) -> "PDFDocument":
         return self
@@ -144,14 +194,28 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
         return copy.deepcopy(self.state)
 
     # ------------------------------------------------------------------ 撤销
-    def _push_undo(self) -> None:
+    def _push_undo(self, light: tuple | None = None) -> None:
+        """记录一次可撤销的操作。
+
+        默认整份 PDF 序列化一份（tobytes）当快照 —— 4.5MB 的扫描件要 20ms，
+        50MB 的要几百毫秒，落在「每画一笔」上就是明显的卡顿。
+        所以笔迹类操作走 light：只记页面 xref + 改动前的笔迹数组，
+        撤销时重放 _rebuild_inks，成本只和笔迹数有关，与文档体积无关。
+        """
+        self._bump()
+        if light is not None:
+            if len(self._undo) >= UNDO_DEPTH:
+                self._undo.pop(0)
+            self._undo.append(light)
+            return
         try:
             raw = self.doc.tobytes(garbage=0, deflate=False)
         except Exception:
+            # 空文档（0 页）没法序列化 —— 没有可回退的内容，直接不记
             return
         if len(self._undo) >= UNDO_DEPTH:
             self._undo.pop(0)
-        self._undo.append((raw, copy.deepcopy(self.state)))
+        self._undo.append(("snapshot", raw, copy.deepcopy(self.state)))
 
     @property
     def can_undo(self) -> bool:
@@ -160,15 +224,35 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
     def undo(self) -> bool:
         if not self._undo:
             return False
-        raw, state = self._undo.pop()
-        try:
-            self.doc.close()
-        except Exception:
-            pass
-        self.doc = fitz.open("pdf", raw)
-        self.state = state
-        self._dirty = True
+        entry = self._undo.pop()
+        if entry[0] == "snapshot":
+            _, raw, state = entry
+            try:
+                self.doc.close()
+            except Exception:
+                pass
+            self.doc = fitz.open("pdf", raw)
+            self.state = state
+        else:
+            # ("ink", page_xref, 改动前的笔迹列表)
+            _, pxref, prev = entry
+            page = None
+            for i in range(self.doc.page_count):
+                if self.doc[i].xref == pxref:
+                    page = self.doc[i]
+                    break
+            if page is None:
+                return False
+            st = self._pstate(page)
+            st["strokes"] = copy.deepcopy(prev)
+            try:
+                self._rebuild_inks(page, st["strokes"])
+            except Exception:
+                pass
+        self._touch()
+        self._bump()
         return True
+
 
     # ------------------------------------------------------------------ 页级状态
     def _pstate(self, page) -> dict[str, Any]:
@@ -220,21 +304,31 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
             return "mixed" if chars >= 5 else "scanned"
         return "text" if chars else "empty"
 
-    def info(self) -> dict[str, Any]:
+    def info(self, with_types: bool = False) -> dict[str, Any]:
+        """文档概览。
+
+        默认不逐页判断类型：page_type 要读整页内容流（扫描件上单页 40ms），
+        100 页的文档就是 4 秒的开屏等待。前端只需要尺寸，类型在翻到那一页时
+        由 /api/page/<n>/objects 顺带给出。
+        """
         meta = self.doc.metadata or {}
+        pages = []
+        for i in range(self.doc.page_count):
+            entry: dict[str, Any] = {"index": i, "size": list(self.page_size(i))}
+            if with_types:
+                entry["type"] = self.page_type(i)
+            pages.append(entry)
         return {
             "path": str(self.path) if self.path else None,
             "page_count": self.doc.page_count,
-            "pages": [
-                {"index": i, "size": list(self.page_size(i)), "type": self.page_type(i)}
-                for i in range(self.doc.page_count)
-            ],
+            "pages": pages,
             "metadata": {k: v for k, v in meta.items() if v},
             "encrypted": bool(self.doc.needs_pass),
             "modified": self._dirty,
             "can_undo": self.can_undo,
             "ocr": self._ocr_engine.info(),
         }
+
 
     def describe(self) -> dict[str, Any]:
         """给 AI 用的"可操作对象清单"：一页一页列出文本/图片/笔迹数量与页面类型。"""
@@ -264,18 +358,31 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
 
     # ================================================================== 渲染
     def render(self, page_no: int, dpi: int = 110, clip: Sequence[float] | None = None, fmt: str = "png") -> bytes:
-        p = self.page(page_no)
-        kw: dict[str, Any] = {"dpi": int(dpi), "colorspace": fitz.csRGB, "alpha": False}
-        if clip:
-            kw["clip"] = fitz.Rect(*norm_rect(clip)) & p.rect
-        pix = p.get_pixmap(**kw)
-        return pix.tobytes(fmt if fmt in ("png", "jpg", "jpeg", "pnm", "pgm", "ppm") else "png")
+        fmt = fmt if fmt in ("png", "jpg", "jpeg", "pnm", "pgm", "ppm") else "png"
+        ck = None if clip is None else tuple(round(float(v), 2) for v in norm_rect(clip))
+        key = ("render", page_no, int(dpi), ck, fmt, self._rev)
+
+        def build() -> bytes:
+            p = self.page(page_no)
+            kw: dict[str, Any] = {"dpi": int(dpi), "colorspace": fitz.csRGB, "alpha": False}
+            if ck:
+                kw["clip"] = fitz.Rect(*ck) & p.rect
+            pix = p.get_pixmap(**kw)
+            return pix.tobytes(fmt)
+
+        return self._cached(key, build)
 
     def thumbnail(self, page_no: int, width: int = 150) -> bytes:
-        p = self.page(page_no)
-        zoom = max(0.05, float(width) / max(1.0, p.rect.width))
-        pix = p.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csRGB, alpha=False)
-        return pix.tobytes("png")
+        key = ("thumb", page_no, int(width), self._rev)
+
+        def build() -> bytes:
+            p = self.page(page_no)
+            zoom = max(0.05, float(width) / max(1.0, p.rect.width))
+            pix = p.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csRGB, alpha=False)
+            return pix.tobytes("png")
+
+        return self._cached(key, build)
+
 
     # ================================================================== 页面操作
     def add_page(self, size: Any = "a4", position: int | None = None, width: float | None = None,
@@ -289,7 +396,7 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
         p = self.doc.new_page(pno=idx, width=w, height=h)
         if background:
             p.draw_rect(p.rect, color=None, fill=hex_to_rgb(background), overlay=False)
-        self._dirty = True
+        self._touch()
         return idx
 
     def delete_pages(self, pages: Any) -> list[int]:
@@ -299,7 +406,7 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
         self._push_undo()
         for i in sorted(targets, reverse=True):
             self.doc.delete_page(i)
-        self._dirty = True
+        self._touch()
         return targets
 
     def move_page(self, source: int, target: int) -> int:
@@ -308,7 +415,7 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
             raise PdfxError("页码越界", "page_out_of_range")
         self._push_undo()
         self.doc.move_page(source, target)
-        self._dirty = True
+        self._touch()
         return target
 
     def rotate_page(self, pages: Any, degrees: int) -> list[int]:
@@ -320,14 +427,14 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
         for i in targets:
             p = self.doc[i]
             p.set_rotation((p.rotation + deg) % 360)
-        self._dirty = True
+        self._touch()
         return targets
 
     def duplicate_page(self, page_no: int, position: int | None = None) -> int:
         self._push_undo()
         idx = self.doc.page_count if position is None else int(position)
         self.doc.fullcopy_page(page_no, idx)
-        self._dirty = True
+        self._touch()
         return idx
 
     def import_pdf(self, src: str | os.PathLike, pages: Any = None, position: int | None = None) -> list[int]:
@@ -347,7 +454,7 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
                 self.doc.insert_pdf(other, from_page=i, to_page=i, start_at=at + k)
         finally:
             other.close()
-        self._dirty = True
+        self._touch()
         return list(range(at, at + len(idxs)))
 
     # ================================================================== 保存
