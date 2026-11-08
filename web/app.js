@@ -1080,6 +1080,35 @@
     } catch (e) { toast(e.message, 'err'); }
   }
 
+  /* 删：笔迹。list_strokes 不给 bbox，按点自行算，再让后端整条删掉。 */
+  async function deleteStroke(o) {
+    const pts = o.points || [];
+    if (!pts.length) return false;
+    const xs = pts.map((p) => p[0]);
+    const ys = pts.map((p) => p[1]);
+    const pad = Math.max(1.5, (o.width || 2) / 2 + 1);
+    const bbox = [
+      Math.min(...xs) - pad, Math.min(...ys) - pad,
+      Math.max(...xs) + pad, Math.max(...ys) + pad,
+    ];
+    try {
+      await api('/api/ink/erase', { json: { page: S.page, bbox, mode: 'stroke' } });
+      S.sel = null;
+      await afterContentChange();
+      toast('已删除笔迹', 'ok');
+    } catch (e) { toast(e.message, 'err'); }
+    return true;
+  }
+
+  /* 删除选中对象。Delete / Backspace 共用；返回 false 表示这次按键不该被吞掉 */
+  function deleteSelection(sel) {
+    if (!sel) return false;
+    if (sel.kind === 'text') { deleteText(sel); return true; }
+    if (sel.kind === 'image') { deleteImage(sel); return true; }
+    if (sel.kind === 'stroke') { deleteStroke(sel); return true; }
+    return false;
+  }
+
   /* ------------------------------------------------------------------ 画布交互 */
   /* pointerdown 时缓存一次 rect：pointermove 里每帧都调 getBoundingClientRect()
      会强制浏览器同步布局，是画笔"一卡一卡"的典型原因。 */
@@ -1504,11 +1533,11 @@
     });
   }
 
-  async function insertImageNow() {
-    const f = await pickFile('image');
-    if (!f) return;
-    const data = await fileToDataURL(f);
-    const dim = await imageSizeOf(data);
+  /* 统一的「把一张图插进当前页」入口：文件选择、Ctrl+V 粘贴都走这里。
+     插入位置是当前视口中心，按原比例、最大占页宽 55% / 页高 60%。 */
+  async function insertImageData(dataUrl, name) {
+    if (!S.doc) { toast('先打开或新建一个文档', 'err'); return null; }
+    const dim = await imageSizeOf(dataUrl);
     const [pw, ph] = sizeOf(S.page);
     // 像素按 96dpi 换成 pt，太大就缩到页面宽度的 55%
     let w = Math.min((dim.w * 72) / 96, pw * 0.55);
@@ -1518,7 +1547,7 @@
     const rect = clampBbox([c[0] - w / 2, c[1] - h / 2, c[0] + w / 2, c[1] + h / 2]);
     try {
       const rec = await api('/api/image', {
-        json: { page: S.page, rect, data_url: data, name: f.name },
+        json: { page: S.page, rect, data_url: dataUrl, name },
       });
       await afterContentChange();
       if (rec) {
@@ -1528,8 +1557,19 @@
         showTab('props');
       }
       setTool('select');
-      toast('图片已插入，拖四周手柄可调整大小', 'ok');
-    } catch (e) { toast(e.message, 'err'); }
+      return rec;
+    } catch (e) {
+      toast(e.message, 'err');
+      return null;
+    }
+  }
+
+  async function insertImageNow() {
+    const f = await pickFile('image');
+    if (!f) return;
+    const data = await fileToDataURL(f);
+    const rec = await insertImageData(data, f.name);
+    if (rec) toast('图片已插入，拖四周手柄可调整大小', 'ok');
   }
 
   /* 移动 / 缩放的提交：松手才落库，过程中只在画布上预览。
@@ -1916,7 +1956,15 @@
   document.addEventListener('drop', async (e) => {
     e.preventDefault();
     const f = e.dataTransfer.files && e.dataTransfer.files[0];
-    if (!f || !f.name.toLowerCase().endsWith('.pdf')) return;
+    if (!f) return;
+    // 拖图片进来 = 插入图片：和 Ctrl+V 走同一条路，用户不必先点工具再选文件
+    if (/^image\//i.test(f.type)) {
+      if (!S.doc) { toast('先打开或新建一个文档', 'err'); return; }
+      const rec = await insertImageData(await fileToDataURL(f), f.name);
+      if (rec) toast('图片已插入，拖四周手柄可调整大小', 'ok');
+      return;
+    }
+    if (!f.name.toLowerCase().endsWith('.pdf')) return;
     const fd = new FormData();
     fd.append('file', f);
     try {
@@ -2039,15 +2087,203 @@
   }
   $$('.tab').forEach((t) => (t.onclick = () => showTab(t.dataset.tab)));
 
+  /* ------------------------------------------------------------------ 剪贴板 */
+  /* Ctrl+V 粘贴图片，Ctrl+C 复制选中的图片/文字。
+     两个来源都要接：
+     1. 系统剪贴板（截图工具、浏览器里另存的图）—— 走 paste 事件；
+     2. 应用内复制：写系统剪贴板失败时（非安全上下文 / 浏览器拒权），
+        退到这块内存，Ctrl+V 仍然贴得出来。 */
+  let clipImage = null;
+
+  function clipboardImageFile(dt) {
+    if (!dt) return null;
+    for (const it of dt.items || []) {
+      if (it.kind === 'file' && /^image\//i.test(it.type)) {
+        const f = it.getAsFile();
+        if (f) return f;
+      }
+    }
+    for (const f of dt.files || []) {
+      if (/^image\//i.test(f.type)) return f;
+    }
+    return null;
+  }
+
+  function clipboardHasText(dt) {
+    if (!dt) return false;
+    return Array.from(dt.types || []).some((t) => t === 'text/plain' || t === 'text/html');
+  }
+
+  function blobToDataURL(blob) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(fr.result);
+      fr.onerror = reject;
+      fr.readAsDataURL(blob);
+    });
+  }
+
+  document.addEventListener('paste', async (e) => {
+    // 弹窗里（比如改文字）粘贴走的还是文字，别抢
+    if ($('#modal').classList.contains('show')) return;
+    const inField = e.target && e.target.closest && e.target.closest('input, textarea');
+    if (inField && clipboardHasText(e.clipboardData)) return;
+
+    const f = clipboardImageFile(e.clipboardData);
+    if (f) {
+      e.preventDefault();
+      if (!S.doc) { toast('先打开或新建一个文档', 'err'); return; }
+      // 截图工具给的图常常没有正经文件名，给一个能在对象列表里认出来的名字
+      const name = f.name && !/^image\.(png|jpe?g|gif|bmp|webp)$/i.test(f.name)
+        ? f.name
+        : `粘贴图片-${S.page + 1}.png`;
+      const data = await fileToDataURL(f);
+      const rec = await insertImageData(data, name);
+      if (rec) {
+        clipImage = null;
+        toast('已粘贴图片，拖四周手柄可调整大小', 'ok');
+      }
+      return;
+    }
+    // 剪贴板里没有图：只有「刚在应用内复制过、系统剪贴板又没写成功」时才兜底。
+    // 剪贴板里有文字就不插手 —— 那多半是用户刚复制了一段文字，不该冒出旧图。
+    if (clipImage && !inField && !clipboardHasText(e.clipboardData)) {
+      e.preventDefault();
+      const c = clipImage;
+      clipImage = null;
+      if (!S.doc) { toast('先打开或新建一个文档', 'err'); return; }
+      const rec = await insertImageData(c.data, c.name);
+      if (rec) toast('已粘贴图片，拖四周手柄可调整大小', 'ok');
+    }
+  });
+
+  async function copySelection() {
+    const sel = S.sel;
+    if (!sel) return false;
+    if (sel.kind === 'text') {
+      const text = sel.text || '';
+      if (!text) return false;
+      try {
+        await navigator.clipboard.writeText(text);
+        toast('已复制文字', 'ok');
+      } catch (e) {
+        toast('浏览器不允许写剪贴板，可改用属性面板里的文字框复制', 'err');
+      }
+      return true;
+    }
+    if (sel.kind !== 'image') return false;
+    try {
+      // 后端统一转成 PNG：剪贴板只可靠地接受 image/png，
+      // 而 PDF 里的图可能是 JPEG/CMYK，原样塞进去会被浏览器拒掉。
+      const url = `/api/image/raw?page=${S.page}&id=${encodeURIComponent(sel.id)}`
+        + `&doc=${encodeURIComponent(S.doc || '')}`;
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) throw new Error('取不到图片数据');
+      const blob = await res.blob();
+      clipImage = { data: await blobToDataURL(blob), name: sel.name || '复制的图片.png' };
+      let sys = false;
+      try {
+        if (typeof ClipboardItem !== 'undefined' && navigator.clipboard && navigator.clipboard.write) {
+          await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+          sys = true;
+        }
+      } catch (e) {
+        sys = false;   // 没权限就只留在应用内，Ctrl+V 仍可用
+      }
+      toast(sys ? '已复制图片，到别处 Ctrl+V 也能贴' : '已复制图片，按 Ctrl+V 可粘贴', 'ok');
+      return true;
+    } catch (e) {
+      toast('复制失败：' + e.message, 'err');
+      return true;
+    }
+  }
+
+  /* ------------------------------------------------------------------ 快捷键面板 */
+  const SHORTCUTS = [
+    {
+      title: '文件',
+      items: [
+        ['保存', ['Ctrl', 'S']],
+        ['撤销', ['Ctrl', 'Z']],
+      ],
+    },
+    {
+      title: '编辑',
+      items: [
+        ['复制选中的图片 / 文字', ['Ctrl', 'C']],
+        ['粘贴剪贴板里的图片', ['Ctrl', 'V']],
+        ['删除选中对象', ['Delete']],
+        ['取消选中 / 收起本栏', ['Esc']],
+      ],
+    },
+    {
+      title: '工具',
+      items: [
+        ['选择 / 移动', ['V']],
+        ['插入文本框', ['T']],
+        ['画笔', ['P']],
+        ['橡皮（只擦笔迹）', ['E']],
+        ['插入图片（选文件）', ['I']],
+        ['拖动页面', ['H']],
+      ],
+    },
+    {
+      title: '浏览',
+      items: [
+        ['上一页 / 下一页', ['PgUp', 'PgDn']],
+        ['放大 / 缩小', ['Ctrl', '滚轮']],
+        ['打开 / 收起本栏', ['?']],
+      ],
+    },
+  ];
+
+  function renderKeys() {
+    const box = $('#keys-body');
+    if (!box || box.dataset.done === '1') return;
+    box.dataset.done = '1';
+    box.innerHTML = SHORTCUTS.map((g) => `
+      <div class="ksec">
+        <div class="ksec-head">${esc(g.title)}</div>
+        ${g.items.map(([d, keys]) => `<div class="krow"><span class="kdesc">${esc(d)}</span>`
+          + `<span class="kbd">${keys.map((k) => `<kbd>${esc(k)}</kbd>`).join('')}</span></div>`).join('')}
+      </div>`).join('');
+  }
+
+  function keysOpen() {
+    const l = $('.layout');
+    return !!l && l.classList.contains('keys-open');
+  }
+
+  function setKeys(open) {
+    const l = $('.layout');
+    const panel = $('#keys-panel');
+    if (!l || !panel) return;
+    if (open) renderKeys();
+    l.classList.toggle('keys-open', !!open);
+    panel.classList.toggle('open', !!open);
+    panel.setAttribute('aria-hidden', open ? 'false' : 'true');
+    $('#btn-keys').classList.toggle('active', !!open);
+    // 面板宽度变了，画布可用宽度跟着变，重算叠加层坐标
+    requestAnimationFrame(() => { drawOverlay(); });
+    try { localStorage.setItem('pdfx.keys', open ? '1' : '0'); } catch (e) { /* 隐私模式 */ }
+  }
+
+  $('#btn-keys').onclick = () => setKeys(!keysOpen());
+  $('#keys-close').onclick = () => setKeys(false);
+
   /* ------------------------------------------------------------------ 快捷键 */
   document.addEventListener('keydown', (e) => {
     if (e.target.matches('input, textarea, select')) return;
     const k = e.key.toLowerCase();
     if (e.ctrlKey || e.metaKey) {
-      if (k === 's') { e.preventDefault(); doSave(); }
-      if (k === 'z') { e.preventDefault(); $('#btn-undo').click(); }
+      if (k === 's') { e.preventDefault(); doSave(); return; }
+      if (k === 'z') { e.preventDefault(); $('#btn-undo').click(); return; }
+      // 没选中对象时不拦：留给浏览器默认的复制（选中页面文字等）
+      if (k === 'c' && S.sel) { e.preventDefault(); copySelection(); return; }
       return;
     }
+    // '?' 在中文输入法下不一定发得出来，F1 作为同一功能的备用键
+    if (e.key === '?' || e.key === 'F1') { e.preventDefault(); setKeys(!keysOpen()); return; }
     if (k === 'v') setTool('select');
     if (k === 't') setTool('text');
     if (k === 'p') setTool('draw');
@@ -2056,11 +2292,13 @@
     if (k === 'h') setTool('pan');
     if (e.key === 'PageDown') { e.preventDefault(); setCurrentPage(S.page + 1, { scroll: true }); }
     if (e.key === 'PageUp') { e.preventDefault(); setCurrentPage(S.page - 1, { scroll: true }); }
-    if (e.key === 'Delete' && S.sel) {
-      if (S.sel.kind === 'text') deleteText(S.sel);
-      else if (S.sel.kind === 'image') deleteImage(S.sel);
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (deleteSelection(S.sel)) e.preventDefault();
     }
-    if (e.key === 'Escape') { S.sel = null; drawOverlay(); renderObjList(); renderProps(); }
+    if (e.key === 'Escape') {
+      if (keysOpen()) { setKeys(false); return; }
+      S.sel = null; drawOverlay(); renderObjList(); renderProps();
+    }
   });
 
   window.addEventListener('resize', () => { drawOverlay(); });
@@ -2075,7 +2313,8 @@
       const caps = (j && j.data && j.data.caps) || [];
       // 缺任何一项新能力都算旧服务端：新前端会调到它没有的接口，用户只会觉得"点了没反应"
       // erase.guarded = /api/erase 已要求显式 allow_content，旧服务端会直接擦掉正文
-      const need = ['text.transform', 'canvas.layered', 'erase.guarded', 'ocr.optional', 'bitmap.cached'];
+      const need = ['text.transform', 'canvas.layered', 'erase.guarded', 'ocr.optional',
+        'bitmap.cached', 'image.clipboard'];
       if (!j.ok || need.some((k) => !caps.includes(k))) {
         throw new Error('stale');
       }
@@ -2088,6 +2327,8 @@
   (async function boot() {
     syncStageClass();
     checkServerCaps();
+    // 上次开着就还开着：这是"随时想看"的辅助面板，不该每次刷新都重开一遍
+    try { if (localStorage.getItem('pdfx.keys') === '1') setKeys(true); } catch (e) { /* 隐私模式 */ }
     try {
       const info = await api('/api/doc');
       await loadInfo(info);

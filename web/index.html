@@ -33,7 +33,7 @@
     <button class="tool" data-tool="erase" title="橡皮擦 (E)：拖过笔迹即可擦掉，页面原有文字与图片不受影响">
       <svg viewBox="0 0 24 24"><path d="M4 16l8-8 6 6-4 4H8l-4-2z" fill="none" stroke-width="2"/><path d="M6 20h14" fill="none" stroke-width="2"/></svg><span>橡皮</span>
     </button>
-    <button class="tool" data-tool="image" title="插入图片：选完直接放到页面中央，再拖手柄调整 (I)">
+    <button class="tool" data-tool="image" title="插入图片 (I)：也可以直接 Ctrl+V 粘贴剪贴板里的图，或把图片文件拖进窗口">
       <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke-width="2"/><circle cx="9" cy="10" r="2"/><path d="M4 18l5-5 4 4 3-3 4 4" fill="none" stroke-width="2"/></svg><span>图片</span>
     </button>
     <button class="tool" data-tool="pan" title="拖动页面 (H)">
@@ -70,11 +70,14 @@
     <span id="zoom-label">100%</span>
     <button class="btn icon" id="zoom-in">+</button>
   </div>
+  <button class="btn icon" id="btn-keys" title="快捷键一览 (?)">
+    <svg viewBox="0 0 24 24"><rect x="2.5" y="6.5" width="19" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M6 10.5h.01M9.4 10.5h.01M12.8 10.5h.01M16.2 10.5h.01M6 13.6h.01M9.4 13.6h.01M12.8 13.6h.01M16.2 13.6h.01M8.4 16.2h7.2" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" fill="none"/></svg>
+  </button>
   <div class="ocr-badge" id="ocr-badge" title="OCR 引擎状态">OCR</div>
 </header>
 
 <div class="stale-bar" id="stale-bar" hidden>
-  <b>服务端还是旧版本</b>，这次的改动（橡皮只擦笔迹、OCR 手动触发、图片删除修复）不会生效。
+  <b>服务端还是旧版本</b>，这次的改动（Ctrl+V 粘贴图片、快捷键侧栏、橡皮只擦笔迹）不会生效。
   请关掉启动脚本的黑色窗口，重新双击 <code>启动PDF工具.bat</code>（会问是否换新版本），再刷新本页。
 </div>
 
@@ -138,6 +141,18 @@
     <div class="tabpane" id="pane-results">
       <div class="pane-head"><span id="result-count" class="muted">未检索</span></div>
       <div class="objlist" id="results"></div>
+    </div>
+  </aside>
+
+  <aside class="keys-panel" id="keys-panel" aria-label="快捷键">
+    <div class="keys-inner">
+      <div class="keys-head">
+        <span>快捷键</span>
+        <span class="keys-sub">输入框内不生效</span>
+        <button class="btn icon ghost" id="keys-close" title="收起 (Esc)">×</button>
+      </div>
+      <div class="keys-body" id="keys-body"></div>
+      <div class="keys-foot">按 <kbd>?</kbd> 随时开关这一栏</div>
     </div>
   </aside>
 </main>

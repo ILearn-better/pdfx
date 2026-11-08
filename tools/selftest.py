@@ -16,6 +16,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import pymupdf as fitz  # noqa: E402
+
 from pdfx import PDFDocument  # noqa: E402
 from pdfx.util import PdfxError, iou  # noqa: E402
 
@@ -258,6 +260,14 @@ def main() -> int:
     ok("移动一张图不会带走同款的另一张", len(users) == 2, f"{len(users)} 张")
     ok("被移动的那张落在新位置", any(abs(i["bbox"][1] - 420) < 30 for i in users),
        str([[round(v) for v in i["bbox"]] for i in users]))
+
+    # 复制图片：界面 Ctrl+C 要拿到 PNG（剪贴板只可靠地收 image/png）
+    png = d.image_png(0, users[0]["id"])
+    ok("复制图片导出的是 PNG", png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 200, f"{len(png)} bytes")
+    got = fitz.Pixmap(png)
+    src = fitz.Pixmap(str(ROOT / "samples" / "logo.png"))
+    ok("导出的图尺寸与原图一致", (got.width, got.height) == (src.width, src.height),
+       f"{got.width}x{got.height} vs {src.width}x{src.height}")
     d.close()
 
     d = fresh("samples/sample_scan.pdf", "ocr_opt.pdf")

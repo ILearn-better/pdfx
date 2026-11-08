@@ -231,6 +231,7 @@ pdfx serve a.pdf --port 8765        # 打开 http://127.0.0.1:8765
 | POST | `/api/search` | `{query, pages?, regex?, force_ocr?}` |
 | POST/PUT/DELETE | `/api/text` | `{page, text, rect\|point}` / `{page, id, text}` / **`{page, id, rect, font_size?}` = 移动缩放** / `{page, id}` |
 | POST/PUT/DELETE | `/api/image` | `{page, rect, data_url}` / `{page, id, data_url}` / **`{page, id, rect, keep_ratio?}` = 移动缩放** / `{page, id, mode}`（`mode` 默认 `purge`＝redaction 真删，`cover`＝只涂纸色） |
+| GET | `/api/image/raw?page=&id=` | 把某个图片实例**转成 PNG** 返回（界面 `Ctrl+C` 复制图片用）。PDF 里的图可能是 JPEG/CMYK，剪贴板只收 PNG，所以统一转码；取不到 xref 的内联图按显示区域渲染 |
 | POST | `/api/ink` `/api/ink/erase` | `{page, strokes}` / `{page, points|bbox, radius, mode}` |
 | POST | `/api/erase` | `{page, points|rects, radius, allow_content?, erase_text?}`。**默认只切笔迹**（等价 `ink/erase --mode cut`）；擦页面内容必须显式 `allow_content: true`，此时文字真删 + 图像涂纸色，返回 `{removed_text_count, covered, strokes_removed, fill}` |
 | POST | `/api/page` `/api/page/move` | 页面增删移 |
@@ -240,7 +241,8 @@ pdfx serve a.pdf --port 8765        # 打开 http://127.0.0.1:8765
 > `/api/save` 对没有 path 的新建文档会返回 `no_path`，调用方需要显式给 `path`。
 
 前端是无构建的原生页面（`web/`），支持选择/文本/画笔/橡皮/图片/拖动六种工具，
-可直接给非技术用户用。
+可直接给非技术用户用。界面上 `Ctrl+V` 贴剪贴板图片、`Ctrl+C` 复制选中图片或文字、
+`Delete` 删选中对象、`Ctrl+S` 保存、`Ctrl+Z` 撤销；顶栏键盘图标（或 `?` / `F1`）开关快捷键侧栏。
 
 ## Python API
 
@@ -254,6 +256,7 @@ with PDFDocument("a.pdf") as d:
         print(line["id"], line["bbox"], line["text"])
     d.update_text(0, "p0:o57,429", "新内容")     # 两类 PDF 同一套调用
     print(d.search("新内容")["total"])
+    png = d.image_png(0, "p0:i@56,500")         # 取某张图 → PNG bytes（复制/转存都够用）
 ```
 
 ## 错误码

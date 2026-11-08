@@ -192,6 +192,17 @@ def main() -> int:
                     again.get("id") != img["id"] and abs(again["bbox"][0] - 100) < 2,
                     f"{again.get('id')} {again.get('bbox')}")
 
+    # ---- 复制图片：界面 Ctrl+C 要把图拿成 PNG ----
+    raw = call(f"/api/image/raw?page=0&id={again['id']}", raw=True)
+    ok_all &= check("GET /api/image/raw 返回 PNG",
+                    raw[:8] == b"\x89PNG\r\n\x1a\n" and len(raw) > 200, f"{len(raw)} bytes")
+    bad_code = 0
+    try:
+        call("/api/image/raw?page=0&id=p0:i@9999,9999", raw=True)
+    except urllib.error.HTTPError as exc:
+        bad_code = exc.code
+    ok_all &= check("GET /api/image/raw 找不到对象时给 400", bad_code == 400, f"HTTP {bad_code}")
+
     # 页面删除放到最后、在新文档上做：删的是第 0 页，主文档还要靠它出文字
     ext = call("/api/extract", {})["data"]
     ok_all &= check("POST /api/extract", "采购合同" in ext["text"], f"{ext['total_chars']} chars")

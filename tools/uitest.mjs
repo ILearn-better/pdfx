@@ -765,6 +765,140 @@ async function main() {
     uiDel.err || `${uiDel.green} 个绿色像素`);
   await shot('image-deleted');
 
+  // ---- 剪贴板：Ctrl+V 粘贴图片 ----
+  // 截图工具复制来的图只有剪贴板，没有文件路径，只能走 paste 事件这条路。
+  console.log('\n== 剪贴板粘贴 ==');
+  const pasteTest = await ev(`(async () => {
+    const doc = (await (await fetch('/api/docs')).json()).data.current;
+    const list = async () => (await (await fetch('/api/image?page=0&doc=' + doc)).json())
+      .data.items.filter((x) => x.source === 'user');
+    const before = (await list()).length;
+    const c = document.createElement('canvas');
+    c.width = 200; c.height = 120;
+    const g = c.getContext('2d');
+    g.fillStyle = '#e8710a'; g.fillRect(0, 0, 200, 120);
+    const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+    const dt = new DataTransfer();
+    dt.items.add(new File([blob], 'clipboard.png', { type: 'image/png' }));
+    document.body.dispatchEvent(new ClipboardEvent('paste', {
+      clipboardData: dt, bubbles: true, cancelable: true,
+    }));
+    await new Promise((z) => setTimeout(z, 2800));
+    const after = await list();
+    return {
+      before, after: after.length,
+      toast: document.querySelector('#toast').textContent,
+      // 粘贴的图必须真的画进位图，而不是只多了一条记录
+      src: document.querySelector('#pages .pbox.current img').src,
+    };
+  })()`);
+  check('Ctrl+V 把剪贴板里的图片粘进当前页', pasteTest.after === pasteTest.before + 1,
+    `${pasteTest.before} → ${pasteTest.after}｜${pasteTest.toast}`);
+
+  // ---- Ctrl+C 复制图片 ----
+  const pickLast = async () => ev(`(async () => {
+    const doc = (await (await fetch('/api/docs')).json()).data.current;
+    const items = (await (await fetch('/api/image?page=0&doc=' + doc)).json())
+      .data.items.filter((x) => x.source === 'user');
+    const it = items[items.length - 1];
+    if (!it) return { err: '没有可选中的图' };
+    const size = (await (await fetch('/api/doc?doc=' + doc)).json()).data.pages[0].size;
+    const box = document.querySelector('#pages .pbox.current');
+    const r = box.getBoundingClientRect();
+    const k = r.width / size[0];
+    const cx = r.left + ((it.bbox[0] + it.bbox[2]) / 2) * k;
+    const cy = r.top + ((it.bbox[1] + it.bbox[3]) / 2) * k;
+    const el = box.querySelector('img');
+    const mk = (t, b) => new PointerEvent(t, { clientX: cx, clientY: cy, bubbles: true,
+      cancelable: true, pointerId: 77, pointerType: 'mouse', isPrimary: true, button: 0, buttons: b });
+    el.dispatchEvent(mk('pointerdown', 1));
+    el.dispatchEvent(mk('pointerup', 0));
+    await new Promise((z) => setTimeout(z, 300));
+    return { id: it.id, count: items.length };
+  })()`);
+  const key = (type, k, code, vk, modifiers = 0) => cdp.send('Input.dispatchKeyEvent', {
+    type, key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers,
+  });
+  const press = async (k, code, vk, modifiers = 0) => {
+    await key('rawKeyDown', k, code, vk, modifiers);
+    await key('keyUp', k, code, vk, modifiers);
+    await sleep(250);
+  };
+
+  const picked = await pickLast();
+  await press('c', 'KeyC', 67, 2);
+  const copyToast = await ev(`document.querySelector('#toast').textContent`);
+  check('选中图片后 Ctrl+C 有反馈', /已复制/.test(copyToast || ''),
+    copyToast || picked.err || '没有提示');
+
+  // 复制完再粘一次：剪贴板写不进去时（无权限/非安全上下文）走应用内兜底
+  const pasteAgain = await ev(`(async () => {
+    const doc = (await (await fetch('/api/docs')).json()).data.current;
+    const n = async () => (await (await fetch('/api/image?page=0&doc=' + doc)).json())
+      .data.items.filter((x) => x.source === 'user').length;
+    const before = await n();
+    document.body.dispatchEvent(new ClipboardEvent('paste', {
+      clipboardData: new DataTransfer(), bubbles: true, cancelable: true,
+    }));
+    await new Promise((z) => setTimeout(z, 2800));
+    return { before, after: await n(), toast: document.querySelector('#toast').textContent };
+  })()`);
+  check('复制后 Ctrl+V 能再贴出一张', pasteAgain.after === pasteAgain.before + 1,
+    `${pasteAgain.before} → ${pasteAgain.after}｜${pasteAgain.toast}`);
+
+  // ---- Delete 键删除选中对象 ----
+  // 注意别断言"删掉的是最后那一张"：两次粘贴落在同一位置、互相重叠，
+  // 点中的是哪一张由命中顺序决定。只断言数量少了一个。
+  const picked2 = await pickLast();
+  await press('Delete', 'Delete', 46);
+  const delKey = await ev(`(async () => {
+    const doc = (await (await fetch('/api/docs')).json()).data.current;
+    const items = (await (await fetch('/api/image?page=0&doc=' + doc)).json())
+      .data.items.filter((x) => x.source === 'user');
+    return { count: items.length, toast: document.querySelector('#toast').textContent };
+  })()`);
+  check('Delete 键删掉选中的图片', delKey.count === picked2.count - 1,
+    `${picked2.err || picked2.count + ' → ' + delKey.count}｜${delKey.toast}`);
+
+  // ---- 快捷键侧栏 ----
+  console.log('\n== 快捷键侧栏 ==');
+  const panel = await ev(`(async () => {
+    document.querySelector('#btn-keys').click();
+    await new Promise((z) => setTimeout(z, 320));
+    const p = document.querySelector('#keys-panel');
+    return {
+      open: document.querySelector('.layout').classList.contains('keys-open'),
+      width: Math.round(p.getBoundingClientRect().width),
+      rows: document.querySelectorAll('#keys-body .krow').length,
+      labels: [...document.querySelectorAll('#keys-body .kdesc')].map((e) => e.textContent),
+      saved: localStorage.getItem('pdfx.keys'),
+    };
+  })()`);
+  check('点快捷键按钮能展开侧栏', panel.open === true && panel.width > 200,
+    `宽 ${panel.width}px`);
+  check('侧栏列出了快捷键条目', panel.rows >= 10, `${panel.rows} 条`);
+  check('侧栏包含复制/粘贴/删除/撤销', ['粘贴剪贴板里的图片', '删除选中对象', '撤销', '复制选中的图片 / 文字']
+    .every((t) => panel.labels.includes(t)), JSON.stringify(panel.labels));
+  check('展开状态记到了本地（刷新后仍在）', panel.saved === '1', String(panel.saved));
+  await shot('shortcut-panel');
+
+  await press('Escape', 'Escape', 27);
+  const closed = await ev(`({
+    open: document.querySelector('.layout').classList.contains('keys-open'),
+    saved: localStorage.getItem('pdfx.keys'),
+  })`);
+  check('Esc 收起侧栏', closed.open === false && closed.saved === '0', JSON.stringify(closed));
+
+  // '?' 再开一次：中文输入法下不一定发得出来，所以 F1 是备用键，这里两个都测
+  await key('rawKeyDown', '?', 'Slash', 191, 8);
+  await key('keyUp', '?', 'Slash', 191, 8);
+  await sleep(300);
+  const openedByQ = await ev(`document.querySelector('.layout').classList.contains('keys-open')`);
+  await press('F1', 'F1', 112);
+  const closedByF1 = await ev(`!document.querySelector('.layout').classList.contains('keys-open')`);
+  check('? 键可以开关侧栏', openedByQ === true);
+  check('F1 也能开关侧栏（问号打不出来时用）', closedByF1 === true);
+
   // ---- 三种浏览方式 ----
   console.log('\n== 浏览方式 ==');
   const singleBoxes = await ev(`document.querySelectorAll('#pages .pbox').length`);

@@ -974,6 +974,43 @@ class ImageMixin:
             )
         return {"page": page_no, "count": len(out), "items": out}
 
+    def image_png(self, page_no: int, target: Any, max_px: int = 2400) -> bytes:
+        """取某个图片实例的像素，统一转成 PNG。
+
+        用途是「复制图片到剪贴板」：系统剪贴板只可靠地接受 image/png，
+        而 PDF 里的图可能是 JPEG / JPEG2000 / CMYK，所以这里统一转码。
+        取不到 xref（内联图像）时退化为按显示区域渲染一块。
+        """
+        item = self._pick_image(self.list_images(page_no)["items"], target)
+        page = self.page(page_no)
+        xref = int(item.get("xref") or 0)
+        raw: bytes | None = None
+        if xref:
+            try:
+                raw = self.doc.extract_image(xref).get("image")
+            except Exception:
+                raw = None
+        if raw:
+            try:
+                pix = fitz.Pixmap(raw)
+                # CMYK / 带额外色板的图直接 tobytes("png") 会抛错，先转 RGB
+                if pix.colorspace is not None and pix.colorspace.n > 3:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                longest = max(pix.width, pix.height)
+                if longest > max_px:
+                    k = 1
+                    while (longest >> k) > max_px:
+                        k += 1
+                    pix.shrink(k)
+                return pix.tobytes("png")
+            except Exception:
+                pass
+        # 内联图像（BI/ID/EI）没有独立 xref：按显示区域渲染，至少能复制走
+        r = fitz.Rect(*item["bbox"])
+        zoom = max(1.0, min(4.0, max_px / max(1.0, r.width)))
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=r, colorspace=fitz.csRGB, alpha=False)
+        return pix.tobytes("png")
+
     def _instance_near(self, page: fitz.Page, rect: Any, taken: list | None = None) -> list[float]:
         """找与给定矩形最吻合的显示实例，返回它的实际 bbox。
 

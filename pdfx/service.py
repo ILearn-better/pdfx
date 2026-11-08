@@ -236,7 +236,7 @@ def create_app(initial: str | None = None) -> Flask:
                 "docs", "doc.activate", "page.import",
                 "text.transform", "image.transform",
                 "ink.local_erase", "canvas.layered", "erase.content", "erase.guarded",
-                "ocr.optional", "bitmap.cached",
+                "ocr.optional", "bitmap.cached", "image.clipboard",
             ],
         }
 
@@ -453,6 +453,21 @@ def create_app(initial: str | None = None) -> Flask:
         return doc.delete_text(int(b["page"]), b.get("ids") or b.get("id"))
 
     # ------------------------------------------------------------------ 图片
+    @app.get("/api/image/raw")
+    def api_image_raw():
+        """把页面上某个图片实例以 PNG 原样交出（界面 Ctrl+C 复制图片用）。
+
+        返回二进制而不是 data_url：前端要的还是 Blob，转一趟 base64 只是
+        把体积放大 33%，截图粘贴来回一下就是几 MB 的无谓开销。
+        """
+        try:
+            with SESSION.lock:
+                doc = SESSION.get(request.args.get("doc"))
+                data = doc.image_png(int(request.args.get("page", 0)), request.args.get("id"))
+            return send_file(io.BytesIO(data), mimetype="image/png")
+        except PdfxError as exc:
+            return jsonify(fail(exc)), 400
+
     @app.get("/api/image")
     @_wrap
     def api_image_list():
