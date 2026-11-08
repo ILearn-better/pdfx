@@ -103,6 +103,29 @@ def _squash(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
 
 
+def _as_text_list(value: Any) -> list[str]:
+    """drop_text 允许传一个字符串或一组字符串。"""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [str(v) for v in value if v is not None]
+    return [str(value)]
+
+
+def _restore_font(name: str, text: str) -> str:
+    """补画别人文字时只能用内置字体 —— 原字体常常是子集或没嵌进页面。"""
+    if has_cjk(text):
+        return "china-s"
+    n = (name or "").lower()
+    if any(k in n for k in ("courier", "mono", "consol")):
+        return "cour"
+    if any(k in n for k in ("times", "serif", "georgia", "song", "ming")):
+        return "tiro"
+    return "helv"
+
+
 def _norm_with_map(text: str) -> tuple[str, list[int]]:
     chars: list[str] = []
     idx: list[int] = []
@@ -506,21 +529,133 @@ class TextMixin:
         return best
 
     # ---------------------------------------------------------------- 底层动作
-    def _redact(self, page: fitz.Page, rects: Sequence[Sequence[float]]) -> None:
-        """真正抹除文字（保留图像与矢量图形）。"""
-        pending = False
+    def _redact(self, page: fitz.Page, rects: Sequence[Sequence[float]], drop_text: Any = None) -> None:
+        """真正抹除文字（保留图像与矢量图形）。
+
+        `drop_text` 是"这次只该删掉的那段文字"。给了它就只删它：红框里**别人的
+        字**会先按整段一起删干净、删除后按原位补画回去。
+        不这么做就会出现"拖一下文本框，底下那段正文跟着没了" ——
+        redaction 是按矩形整块删字符的，切到谁就删谁。
+        """
+        boxes = []
         for r in rects:
             rr = fitz.Rect(*norm_rect(r))
-            if rr.is_empty:
-                continue
+            if not rr.is_empty:
+                boxes.append(rr)
+        if not boxes:
+            return
+        targets = [t for t in (_squash(x) for x in _as_text_list(drop_text)) if t]
+        keep: list[dict] = []
+        if targets:
+            keep = self._spans_outside_target(page, boxes, targets)
+        # 别人的那段字往往比目标框宽（框只压住半行）。只 redact 半行会留下半截，
+        # 再补画整行就叠字；所以把它们的整段 bbox 一起纳入，删干净再完整补画。
+        areas = list(boxes) + [fitz.Rect(*sp["bbox"]) for sp in keep]
+        for rr in areas:
             page.add_redact_annot(rr)
-            pending = True
-        if pending:
-            page.apply_redactions(
-                images=fitz.PDF_REDACT_IMAGE_NONE,
-                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-                text=fitz.PDF_REDACT_TEXT_REMOVE,
-            )
+        page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_NONE,
+            graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+            text=fitz.PDF_REDACT_TEXT_REMOVE,
+        )
+        if keep:
+            self._restore_spans(page, keep)
+
+    def _spans_outside_target(self, page: fitz.Page, boxes: list[fitz.Rect], targets: list[str]) -> list[dict]:
+        """框里不属于目标文字的那些 span（删完要补画的候选）。"""
+        out: list[dict] = []
+        seen: set[tuple] = set()
+        # 目标文字按行拆开：文本框的每一行在文本层里就是一条 span，整行相等最可靠。
+        lines = {n for t in targets for n in (_squash(x) for x in re.split(r"[\r\n]+", t)) if n}
+        # 有些 PDF 会把同一行按颜色/字体拆成几条 span，这时只能退化成"是不是目标的子串"。
+        # 加一个字符预算，避免正文里恰好有同样的词被误认成目标而一起删掉。
+        budget = sum(len(t) for t in targets) + 2
+        used = 0
+        spans = self._page_spans(page)
+        for b in boxes:
+            for sp in self._spans_touching(spans, b):
+                n = _squash(sp.get("text") or "")
+                if not n:
+                    continue
+                if n in lines:
+                    continue
+                if any(n in tg for tg in targets) and used + len(n) <= budget:
+                    used += len(n)
+                    continue
+                key = (n, tuple(round(v, 1) for v in sp["bbox"]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(sp)
+        return out
+
+    def _page_spans(self, page: fitz.Page) -> list[dict]:
+        """整页的 span（完整文本，不被 clip 截断），带位置/字号/颜色/字体。
+
+        必须整页取：`get_text("dict", clip=..)` 会把跨出裁剪框的 span 文本截断，
+        拿截断的文本去补画，页面上就会出现"前半行新字 + 后半行旧字"。
+        """
+        try:
+            data = page.get_text("dict")
+        except Exception:
+            return []
+        out: list[dict] = []
+        for blk in data.get("blocks", []):
+            if blk.get("type") != 0:
+                continue
+            for line in blk.get("lines") or []:
+                for sp in line.get("spans") or []:
+                    t = sp.get("text") or ""
+                    bb = sp.get("bbox") or []
+                    if not t.strip() or len(bb) != 4:
+                        continue
+                    origin = sp.get("origin") or (bb[0], bb[3])
+                    out.append(
+                        {
+                            "text": t,
+                            "bbox": [float(v) for v in bb],
+                            "origin": [float(origin[0]), float(origin[1])],
+                            "size": float(sp.get("size") or 10.0),
+                            "color": int(sp.get("color") or 0),
+                            "font": sp.get("font") or "",
+                        }
+                    )
+        return out
+
+    @staticmethod
+    def _spans_touching(spans: list[dict], box: fitz.Rect) -> list[dict]:
+        hit = []
+        for sp in spans:
+            try:
+                if fitz.Rect(*sp["bbox"]).intersects(box):
+                    hit.append(sp)
+            except Exception:
+                continue
+        return hit
+
+    def _restore_spans(self, page: fitz.Page, spans: list[dict]) -> None:
+        """把被 redaction 顺带删掉的"别人的字"按原位置补回去。
+
+        字体只能用内置的（原有字体多半是子集、页面里拿不到字体文件），
+        所以字号、位置、颜色照抄，字形可能与原稿有极小差异 ——
+        但总比整段正文消失好。
+        """
+        alive = [_squash(sp.get("text") or "") for sp in self._page_spans(page)]
+        for sp in spans:
+            n = _squash(sp.get("text") or "")
+            if not n or n in alive:
+                continue
+            try:
+                page.insert_text(
+                    fitz.Point(float(sp["origin"][0]), float(sp["origin"][1])),
+                    sp["text"],
+                    fontname=_restore_font(sp.get("font") or "", sp["text"]),
+                    fontsize=max(1.0, float(sp["size"])),
+                    color=tuple(_color_from_int(sp.get("color") or 0)),
+                    overlay=True,
+                )
+            except Exception:
+                continue
 
     def _paper_color(self, page: fitz.Page) -> tuple[float, float, float]:
         """页面纸张底色：低分辨率渲染整页后取四角最亮者。
@@ -850,7 +985,7 @@ class TextMixin:
             lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
             color = color if color is not None else ((0.96, 0.96, 0.96) if lum < 0.4 else (0.08, 0.08, 0.09))
         else:
-            self._redact(page, [bbox])
+            self._redact(page, [bbox], drop_text=item.get("text"))
             color = color if color is not None else (item.get("color") or [0, 0, 0])
 
         style = self._style_of(item, {
@@ -988,7 +1123,7 @@ class TextMixin:
             lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
             ink = color if color is not None else ((0.96, 0.96, 0.96) if lum < 0.4 else (0.08, 0.08, 0.09))
         else:
-            self._redact(page, [old])
+            self._redact(page, [old], drop_text=text)
             ink = color if color is not None else (item.get("color") or [0, 0, 0])
 
         if reflow:
@@ -1046,6 +1181,7 @@ class TextMixin:
         self._push_undo()
         page = self.page(page_no)
         redact_boxes = []
+        drop_texts = []
         covered = 0
         for it in found:
             if it.get("source") == "ocr":
@@ -1053,8 +1189,9 @@ class TextMixin:
                 covered += 1
             else:
                 redact_boxes.append(it["bbox"])
+                drop_texts.append(it.get("text") or "")
         if redact_boxes:
-            self._redact(page, redact_boxes)
+            self._redact(page, redact_boxes, drop_text=drop_texts)
 
         st = self._pstate(page)
         ids = {it.get("id") for it in found}

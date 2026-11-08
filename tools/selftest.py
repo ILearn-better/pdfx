@@ -165,6 +165,23 @@ def main() -> int:
     d.delete_text(0, mt["id"])
     ok("多行文本框可整体删除", d.search("第二行更长")["total"] == 0)
 
+    # 文本框压在正文上：移动/删除它只能删掉它自己，底下的正文必须原样保留。
+    # redaction 是按矩形整块删字符的，早先拖一下文本框就把那行正文吃掉了。
+    under = [x for x in d.list_text(0)["items"] if x["source"] == "text"][1]
+    under_text = under["text"]
+    ub = under["bbox"]
+    cover = d.add_text(0, "盖住测试", rect=[ub[0], ub[1] - 2, ub[2], ub[3] + 2], font_size=12)
+    ok("文本框可以压在正文上插入", d.search(under_text)["total"] >= 1, under_text[:18])
+    d.transform_text(0, cover["id"], rect=[cover["bbox"][0] + 30, cover["bbox"][1] + 70,
+                                           cover["bbox"][2] + 30, cover["bbox"][3] + 70])
+    ok("移走压在正文上的文本框，正文不被带走", d.search(under_text)["total"] >= 1,
+       f"原文「{under_text[:16]}」可检索")
+    ok("补回来的正文没有重复", d.page(0).get_text("text").count(under_text) == 1,
+       f"出现 {d.page(0).get_text('text').count(under_text)} 次")
+    d.delete_text(0, cover["id"])
+    ok("删除压在正文上的文本框，正文不被带走", d.search(under_text)["total"] >= 1,
+       f"原文「{under_text[:16]}」可检索")
+
     ts2 = d.transform_image(0, tr["id"], [300, 600, 420, 700], keep_ratio=False)
     ok("拉伸图片（单向）", abs((ts2["bbox"][2] - ts2["bbox"][0]) - 120) < 6, f"bbox={ts2['bbox']}")
 

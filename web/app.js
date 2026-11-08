@@ -579,24 +579,39 @@
   }
 
   function syncOcrButton() {
-    const b = $('#btn-ocr');
-    if (!b) return;
     const on = ocrOn();
     const stale = ocrStale();
-    b.textContent = stale ? '刷新识别' : on ? '收起识别' : '识别本页';
-    b.classList.toggle('active', on);
     // 结构化页本来就有文字层，不需要识别，别让按钮显得"点了没反应"
     const useful = S.type === 'scanned' || S.type === 'mixed';
-    b.disabled = false;
-    if (stale) {
-      b.title = '这一页内容改过，识别框还是按旧位图算的；点一下重新识别，或点列表里的「收起」关掉';
-    } else if (on) {
-      b.title = useful ? '收起这一页的识别结果（识别结果仍缓存在后端，再点可继续用）'
-        : '收起这一页的额外识别结果';
-    } else {
-      b.title = useful
-        ? '扫描件没有文字层，识别后文字才能被选中、检索（约 1~3 秒）'
-        : '这一页本身就有文字层，不需要 OCR；点了会额外识别一次，用来校对图文是否一致';
+    const b = $('#btn-ocr');
+    if (b) {
+      b.textContent = stale ? '刷新识别' : on ? '收起识别' : '识别本页';
+      b.classList.toggle('active', on);
+      b.disabled = false;
+      if (stale) {
+        b.title = '这一页内容改过，识别框还是按旧位图算的；点一下重新识别，或点列表里的「收起」关掉';
+      } else if (on) {
+        b.title = useful ? '收起这一页的识别结果（识别结果仍缓存在后端，再点可继续用）'
+          : '收起这一页的额外识别结果';
+      } else {
+        b.title = useful
+          ? '扫描件没有文字层，识别后文字才能被选中、检索（约 1~3 秒）'
+          : '这一页本身就有文字层，不需要 OCR；点了会额外识别一次，用来校对图文是否一致';
+      }
+    }
+    // 顶栏那个是显式的开关（用户反馈在对象面板里找不到），和面板按钮同一套状态
+    const top = $('#btn-ocr-top');
+    if (top) {
+      top.textContent = on ? (stale ? '本页 OCR 待刷新' : '本页 OCR 开') : '本页 OCR 关';
+      top.classList.toggle('on', on);
+      top.classList.toggle('warn', on && stale);
+      top.title = stale
+        ? '这一页内容改过，识别框可能偏了；点一下重新识别'
+        : on
+          ? '这一页已开启 OCR；点一下收起识别结果'
+          : (useful
+            ? '这一页是扫描件，没有文字层：点一下识别本页文字（约 1~3 秒）'
+            : '这一页本身就有文字层；如需校对图文是否一致，点一下可额外识别一次');
     }
   }
 
@@ -2141,6 +2156,8 @@
     drawOverlay();
   };
   $('#btn-ocr').onclick = () => doOcrPage();
+  const ocrTop = $('#btn-ocr-top');
+  if (ocrTop) ocrTop.onclick = () => doOcrPage();
   // 检索时扫描件必须识别（用户主动发起，等得起），这个开关只管检索
   const ocrChk = $('#obj-ocr');
   if (ocrChk) ocrChk.onchange = (e) => { S.forceOcr = e.target.checked; };

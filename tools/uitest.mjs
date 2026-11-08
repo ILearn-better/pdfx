@@ -1111,6 +1111,23 @@ async function main() {
   check('扫描件的类型标识仍然正确', String(ocrBefore.type).trim() === '扫描件', String(ocrBefore.type));
   check('对象面板给出「识别本页」入口', /识别/.test(String(ocrBefore.btn)), String(ocrBefore.btn));
 
+  // 用户反馈在面板里找不到开关，所以顶栏必须有一个显式的「本页 OCR」开关
+  const ocrTop = await ev(`(() => {
+    const b = document.querySelector('#btn-ocr-top');
+    if (!b) return { err: '顶栏没有 OCR 开关' };
+    const r = b.getBoundingClientRect();
+    return {
+      text: b.textContent.trim(), w: Math.round(r.width), h: Math.round(r.height),
+      left: Math.round(r.left), right: Math.round(r.right), vw: window.innerWidth,
+    };
+  })()`);
+  check('顶栏有显式的「本页 OCR」开关（可见）',
+    !ocrTop.err && ocrTop.w > 40 && ocrTop.h > 14 && /OCR/.test(String(ocrTop.text)),
+    ocrTop.err || `${ocrTop.text} · ${ocrTop.w}×${ocrTop.h}`);
+  check('OCR 开关落在首屏可视区内（不用横向滚动去找）',
+    !ocrTop.err && ocrTop.left >= 0 && ocrTop.right <= ocrTop.vw,
+    ocrTop.err || `${ocrTop.left}~${ocrTop.right} / ${ocrTop.vw}`);
+
   const ocrAfter = await ev(`(async () => {
     document.querySelector('#btn-ocr').click();
     for (let i = 0; i < 80; i++) {
@@ -1120,11 +1137,13 @@ async function main() {
     return {
       ocrTag: document.querySelectorAll('#objlist .tag.ocr').length,
       rows: document.querySelectorAll('#objlist .obj').length,
+      top: (document.querySelector('#btn-ocr-top') || {}).textContent || '',
       toast: (document.querySelector('#toast') || {}).textContent,
     };
   })()`);
   check('点「识别本页」之后文字才出现', ocrAfter.ocrTag > 0,
     `${ocrAfter.ocrTag} 行 OCR｜${ocrAfter.toast}`);
+  check('识别后顶栏开关显示「本页 OCR 开」', /OCR\s*开/.test(String(ocrAfter.top)), String(ocrAfter.top));
   await shot('ocr-manual');
 
   // 识别之后再改内容：旧识别框和画面已经对不上，但开不开是用户的开关 ——
@@ -1142,6 +1161,7 @@ async function main() {
       ocrTag: document.querySelectorAll('#objlist .tag.ocr').length,
       rows: document.querySelectorAll('#objlist .obj').length,
       btn: (document.querySelector('#btn-ocr') || {}).textContent,
+      top: (document.querySelector('#btn-ocr-top') || {}).textContent || '',
       tip: !!document.querySelector('#objlist .ocr-tip'),
       tipText: (document.querySelector('#objlist .ocr-tip') || {}).textContent || '',
       toast: (document.querySelector('#toast') || {}).textContent,
@@ -1150,6 +1170,7 @@ async function main() {
   check('改完内容后 OCR 仍然开着（不替用户关）', ocrStale.ocrTag > 0,
     `OCR 行 ${ocrStale.ocrTag}｜${ocrStale.toast}`);
   check('改完内容后按钮变成「刷新识别」', /刷新识别/.test(String(ocrStale.btn)), String(ocrStale.btn));
+  check('顶栏开关同步提示「待刷新」', /待刷新/.test(String(ocrStale.top)), String(ocrStale.top));
   check('对象面板给出「刷新识别 / 收起」提示', ocrStale.tip && /刷新识别/.test(ocrStale.tipText),
     ocrStale.tipText.slice(0, 40));
 
@@ -1189,11 +1210,13 @@ async function main() {
     return {
       ocrTag: document.querySelectorAll('#objlist .tag.ocr').length,
       btn: (document.querySelector('#btn-ocr') || {}).textContent,
+      top: (document.querySelector('#btn-ocr-top') || {}).textContent || '',
     };
   })()`);
   check('点「收起识别」时 OCR 才真的关掉', ocrOff.ocrTag === 0,
     `OCR 行 ${ocrOff.ocrTag}｜按钮 ${ocrOff.btn}`);
   check('收起后按钮回到「识别本页」', /识别本页/.test(String(ocrOff.btn)), String(ocrOff.btn));
+  check('收起后顶栏开关回到「本页 OCR 关」', /OCR\s*关/.test(String(ocrOff.top)), String(ocrOff.top));
 
   console.log(`\n合计 ${pass} 项通过，${fail} 项失败`);
   if (errors.length) {
