@@ -37,7 +37,9 @@
     busy: false,
     rev: 1,               // 后端文档修订号：内容一变就变，位图 URL 用它做缓存键
     sid: '',              // 后端进程标识：重启后换掉，避免拿到上次进程的缓存位图
-    ocrPages: new Set(),  // 已经手动识别过文字的页（不再自动 OCR）
+    ocrPages: new Set(),  // 用户主动开了 OCR 的页 —— 开不开只由用户决定
+    ocrStale: new Set(),  // 开着 OCR 但页面内容改过：框按旧位图算的，等用户点刷新
+    ocrCache: new Map(),  // page → 上一轮识别结果（跨页翻回来还要能显示，不能拿别页的）
     brush: { color: '#d64545', width: 2.2 },
     eraser: { radius: 10 },   // 只擦自己画的笔迹，绝不碰页面原有内容
     textStyle: { size: 12, color: '#111111' },
@@ -496,6 +498,8 @@
     S.sel = null;
     S.hits = [];
     S.ocrPages = new Set();   // OCR 结果按页记，换文档就清空
+    S.ocrStale = new Set();
+    S.ocrCache = new Map();
     syncStageClass();
     // 先列文档（左侧栏先有内容），再渲染页面，观感上不会"空一下"
     await refreshDocList();
@@ -521,17 +525,44 @@
   }
 
   /* ------------------------------------------------------------------ 对象与叠加层 */
+  /* OCR 的开关只有用户能改：点「识别本页」打开，点「收起识别」关闭。
+     程序自己绝不去开（翻页不再自动识别），也绝不去关
+     （内容改完仍保持开着，只是框可能偏了，标成"待刷新"由用户决定何时重算）。 */
+  function ocrOn() {
+    return S.ocrPages.has(S.page);
+  }
+  function ocrStale() {
+    return ocrOn() && S.ocrStale.has(S.page);
+  }
+  /* 过期页面上的 OCR 对象只能看不能改：坐标是旧位图算的，
+     拿它去 redact / 覆盖会落到错误位置，把旁边的正文抹掉。 */
+  function ocrLocked(o) {
+    return !!o && o.source === 'ocr' && ocrStale();
+  }
+  function warnOcrLocked() {
+    toast('这一页内容改过，识别框可能偏了；先点「刷新识别」再编辑这一行', 'err');
+  }
+  /* 这一次请求是否需要后端真跑 OCR。检索（forceOcr）是用户主动发起，算需要。 */
   function wantOcr() {
-    // 只有用户手动点过「识别本页」的页才带 OCR 参数。
-    // 以前是"扫描页自动识别"，翻一页等 1~3 秒，连续模式下一路卡。
-    return S.forceOcr || S.ocrPages.has(S.page);
+    return S.forceOcr || (ocrOn() && !ocrStale());
   }
 
   async function refreshObjects() {
     if (!S.doc) return;
     try {
-      const objs = await api(`/api/page/${S.page}/objects?ocr=${wantOcr() ? 1 : 0}`);
-      S.objs = { texts: objs.texts.items, images: objs.images.items, strokes: objs.strokes.items };
+      const run = wantOcr();
+      const objs = await api(`/api/page/${S.page}/objects?ocr=${run ? 1 : 0}`);
+      let texts = objs.texts.items;
+      // 开着 OCR 但框已过期：不重跑（整页 1~3 秒），也不把它关掉，
+      // 上一轮识别结果原样留着，用户点了「刷新识别」才重算。
+      // 取缓存时必须按页取 —— 翻页后 S.objs 已经是别页的了。
+      if (ocrOn() && !run) {
+        const keep = S.ocrCache.get(S.page) || [];
+        if (keep.length) texts = texts.concat(keep);
+      }
+      S.objs = { texts, images: objs.images.items, strokes: objs.strokes.items };
+      // 真正跑过识别：把这一页的结果记下来，之后改内容/翻页回来都还有框可看
+      if (run) S.ocrCache.set(S.page, texts.filter((t) => t.source === 'ocr'));
       S.size = objs.size;
       S.sizes[S.page] = objs.size;
       S.type = objs.type;
@@ -550,19 +581,43 @@
   function syncOcrButton() {
     const b = $('#btn-ocr');
     if (!b) return;
-    const done = S.ocrPages.has(S.page);
-    b.textContent = done ? '重新识别' : '识别本页';
+    const on = ocrOn();
+    const stale = ocrStale();
+    b.textContent = stale ? '刷新识别' : on ? '收起识别' : '识别本页';
+    b.classList.toggle('active', on);
     // 结构化页本来就有文字层，不需要识别，别让按钮显得"点了没反应"
     const useful = S.type === 'scanned' || S.type === 'mixed';
     b.disabled = false;
-    b.title = useful
-      ? (done ? '这一页已经识别过，点一下可强制重新识别' : '扫描件没有文字层，识别后文字才能被选中、检索')
-      : '这一页本身就有文字层，不需要 OCR；点了会额外识别一次，用来校对图文是否一致';
+    if (stale) {
+      b.title = '这一页内容改过，识别框还是按旧位图算的；点一下重新识别，或点列表里的「收起」关掉';
+    } else if (on) {
+      b.title = useful ? '收起这一页的识别结果（识别结果仍缓存在后端，再点可继续用）'
+        : '收起这一页的额外识别结果';
+    } else {
+      b.title = useful
+        ? '扫描件没有文字层，识别后文字才能被选中、检索（约 1~3 秒）'
+        : '这一页本身就有文字层，不需要 OCR；点了会额外识别一次，用来校对图文是否一致';
+    }
   }
 
-  /* 手动 OCR：只对当前页，结果由后端按图像哈希缓存，翻回来不用再等 */
-  async function doOcrPage() {
+  /* 关掉这一页的 OCR 显示（只影响显示，识别结果仍在后端缓存里） */
+  async function closeOcrPage() {
+    S.ocrPages.delete(S.page);
+    S.ocrStale.delete(S.page);
+    syncOcrButton();
+    await refreshObjects();
+    toast('已收起这一页的识别结果', '');
+  }
+
+  /* 手动 OCR：只对当前页，结果由后端按图像哈希缓存，翻回来不用再等。
+     再点一次 = 收起（把显示关掉），开关始终由用户掌握。 */
+  async function doOcrPage(opts = {}) {
     if (!S.doc) return;
+    const force = !!opts.force;
+    if (!force && ocrOn() && !ocrStale()) {
+      await closeOcrPage();
+      return;
+    }
     if (S.type !== 'scanned' && S.type !== 'mixed') {
       toast('这一页已有文字层，直接选中即可；如需校对可再点一次', '');
     }
@@ -571,13 +626,19 @@
     btn.disabled = true;
     btn.textContent = '识别中…';
     const was = S.forceOcr;
+    const wasStale = S.ocrStale.has(S.page);
     S.forceOcr = true;
     try {
+      // 正在重算：先摘掉"待刷新"标记，否则 refreshObjects 重建列表时
+      // 会照着旧标记又把提示条挂回来（识别完了还显示"可能偏了"）。
+      S.ocrStale.delete(S.page);
       await refreshObjects();
       S.ocrPages.add(S.page);
       const n = S.objs.texts.filter((t) => t.source === 'ocr').length;
       toast(n ? `已识别 ${n} 行文字` : '这一页没识别出文字（可能是空白页或图像质量太低）', n ? 'ok' : '');
     } catch (e) {
+      // 识别失败：框还是旧的，把"待刷新"提示还原，别让用户以为已经是最新的
+      if (wasStale) { S.ocrStale.add(S.page); renderObjList(); }
       toast(e.message, 'err');
     } finally {
       S.forceOcr = was;
@@ -932,11 +993,24 @@
       });
     });
 
+    box.innerHTML = '';
+    if (ocrStale()) {
+      // 只提示，不替用户改开关：想用就点刷新，不想看就收起
+      const tip = document.createElement('div');
+      tip.className = 'ocr-tip';
+      tip.innerHTML = `<span>这一页改过内容，下面的识别框可能偏了</span>
+        <div class="ocr-tip-btns">
+          <button class="mini" id="tip-ocr-refresh">刷新识别</button>
+          <button class="mini ghost" id="tip-ocr-off">收起</button>
+        </div>`;
+      box.appendChild(tip);
+      tip.querySelector('#tip-ocr-refresh').onclick = () => doOcrPage({ force: true });
+      tip.querySelector('#tip-ocr-off').onclick = () => closeOcrPage();
+    }
     if (!rows.length) {
-      box.innerHTML = '<div class="empty-list">本页没有可编辑对象</div>';
+      box.insertAdjacentHTML('beforeend', '<div class="empty-list">本页没有可编辑对象</div>');
       return;
     }
-    box.innerHTML = '';
     rows.forEach((r) => {
       const el = document.createElement('div');
       el.className = 'obj' + (S.sel && S.sel.id === r.obj.id && S.sel.kind === r.obj.kind ? ' sel' : '');
@@ -965,6 +1039,7 @@
       const color = Array.isArray(o.color)
         ? '#' + o.color.map((v) => Math.round(v * 255).toString(16).padStart(2, '0')).join('')
         : '#111111';
+      const locked = ocrLocked(o);
       box.innerHTML = `
         <div class="field"><label>文本内容</label>
           <textarea data-f="text" id="p-text">${esc(o.text)}</textarea></div>
@@ -975,17 +1050,19 @@
         <div class="field"><label>颜色</label>
           <div class="color-row"><input type="color" id="p-color" value="${color}" /><input type="text" id="p-color-hex" value="${color}" /></div>
         </div>
-        <div class="hint" id="p-hint"></div>
+        <div class="hint${locked ? ' warn' : ''}" id="p-hint"></div>
         <div class="actions">
-          <button class="btn primary" id="p-apply">应用修改</button>
-          <button class="btn danger" id="p-del">删除</button>
+          <button class="btn primary" id="p-apply"${locked ? ' disabled' : ''}>应用修改</button>
+          <button class="btn danger" id="p-del"${locked ? ' disabled' : ''}>删除</button>
         </div>`;
       const hex = $('#p-color-hex');
       $('#p-color').oninput = (e) => (hex.value = e.target.value);
       hex.oninput = (e) => { if (/^#[0-9a-f]{6}$/i.test(e.target.value)) $('#p-color').value = e.target.value; };
-      $('#p-hint').textContent = (o.source === 'ocr'
-        ? 'OCR 文字没有真正的文字层，修改时会用页面底色覆盖原位置后重绘。'
-        : '会先抹掉原文字（保留图像），再按原样式重绘。') + ' 在画布上拖动可移动，拖四角可缩放（字号联动）。';
+      $('#p-hint').textContent = locked
+        ? '这一页内容改过，这一行 OCR 的框是按旧位图算的；先点「刷新识别」重算，再改它。'
+        : (o.source === 'ocr'
+          ? 'OCR 文字没有真正的文字层，修改时会用页面底色覆盖原位置后重绘。'
+          : '会先抹掉原文字（保留图像），再按原样式重绘。') + ' 在画布上拖动可移动，拖四角可缩放（字号联动）。';
       $('#p-apply').onclick = () => applyTextEdit(o);
       $('#p-del').onclick = () => deleteText(o);
     } else if (o.kind === 'image') {
@@ -1027,21 +1104,20 @@
      顺序很关键 —— 先把新位图的请求发出去（URL 里的 rev 已由写接口的响应更新），
      再等对象列表回来。反过来做的话，位图要等 JSON 往返完才开始下载，
      一次拖动提交就白等一个来回。 */
-  /* 一旦落笔改了页面，上一轮 OCR 的框就过期了：位图变了，识别结果和
-     实际画面已经对不上。继续拿旧框去框字，就会"框在这里、字在那里"，
-     而且后端每次都要重跑整页识别（1~3 秒）。所以改完先收起，需要时再点
-     「识别本页」—— OCR 只在用户主动要的时候跑。 */
-  function dropStaleOcr() {
-    if (!S.ocrPages.has(S.page)) return;
-    const had = (S.objs.texts || []).some((t) => t.source === 'ocr');
-    S.ocrPages.delete(S.page);
+  /* 内容改了：这一页的识别框是按旧位图算的，位置可能对不上。
+     但"开不开 OCR"是用户的开关 —— 不替他关，也不自动重跑（整页 1~3 秒）。
+     只打一个"待刷新"标记，用户点「刷新识别」才重算，点「收起识别」才关掉。 */
+  function markOcrStale() {
+    if (!ocrOn() || S.ocrStale.has(S.page)) return;
+    S.ocrStale.add(S.page);
     syncOcrButton();
-    if (had) toast('页面内容已改，OCR 结果先收起；需要时点「识别本页」', '');
+    renderObjList();
+    toast('这一页内容改过了，识别框可能偏了；点「刷新识别」重算，或「收起识别」关掉', '');
   }
 
   async function afterContentChange(opts = {}) {
     const { pageImage = true } = opts;
-    dropStaleOcr();
+    markOcrStale();
     reloadThumb(S.page);
     if (pageImage) reloadPageImage(S.page);
     requestAnimationFrame(renderDocList);
@@ -1049,6 +1125,7 @@
   }
 
   async function applyTextEdit(o) {
+    if (ocrLocked(o)) return warnOcrLocked();
     const text = $('#p-text').value;
     if (!text.trim()) return toast('内容不能为空', 'err');
     const size = parseFloat($('#p-size').value) || (o.size || 12);
@@ -1062,6 +1139,7 @@
   }
 
   async function deleteText(o) {
+    if (ocrLocked(o)) return warnOcrLocked();
     try {
       await api('/api/text', { method: 'DELETE', json: { page: S.page, id: o.id } });
       S.sel = null;
@@ -1274,6 +1352,7 @@
       // 1) 手柄优先：选中状态下四角四边都能拖
       const hIdx = hitHandle(pt, S.sel && S.sel.bbox);
       if (hIdx != null) {
+        if (ocrLocked(S.sel)) { warnOcrLocked(); return; }
         S.drag = {
           kind: 'resize', dir: DIRS[hIdx], obj: S.sel, start: S.sel.bbox.slice(),
           cur: S.sel.bbox.slice(), anchor: pt, size: S.sel.size || null,
@@ -1289,6 +1368,16 @@
         // 笔迹只支持选中后删除，没有"拖动"这回事——给它建 drag 会让松手时
         // 拿笔迹 id 去调 /api/image，白报一个错
         if (hit.kind !== 'stroke') {
+          if (ocrLocked(hit)) {
+            // 框是旧位图算的，拿它去 redact 会抹错位置。让选中照常生效，
+            // 但先拦住拖动，提示用户刷新识别。
+            warnOcrLocked();
+            renderObjList();
+            renderProps();
+            showTab('props');
+            paint('both');
+            return;
+          }
           S.drag = {
             kind: 'move', dir: [0, 0], obj: hit, start: hit.bbox.slice(),
             cur: hit.bbox.slice(), anchor: pt, size: hit.size || null,
@@ -1446,10 +1535,12 @@
       paint('both');
       try {
         await api('/api/ink', { json: { page: S.page, strokes: [{ points: d.points, color: d.color, width: d.width }] } });
-        dropStaleOcr();
+        markOcrStale();
         const objs = await api(`/api/page/${S.page}/objects?ocr=0`);
+        const keepOcr = (S.objs.texts || []).filter((t) => t.source === 'ocr');
         S.objs.strokes = objs.strokes.items;
-        if ((S.objs.texts || []).some((t) => t.source === 'ocr')) S.objs.texts = objs.texts.items;
+        // 画笔不改文字：原生对象刷新，OCR 结果原样留着（开关是用户的，不替他收起）
+        S.objs.texts = objs.texts.items.concat(keepOcr);
         paint('both');
         renderObjList();
         reloadThumb(S.page);

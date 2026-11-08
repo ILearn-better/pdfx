@@ -323,6 +323,21 @@ button { font: inherit; }
 .obj .meta { font-size: 10.5px; color: var(--muted); margin-top: 3px; font-variant-numeric: tabular-nums; }
 .empty-list { color: var(--muted); font-size: 12px; text-align: center; padding: 24px 8px; }
 
+/* OCR 开着但页面内容改过：只提示，开关仍由用户决定 */
+.ocr-tip {
+  border: 1px dashed #e0b872; background: #fffaf0; color: #8a5a00;
+  border-radius: 7px; padding: 7px 9px; margin-bottom: 6px;
+  font-size: 11.5px; line-height: 1.5;
+}
+.ocr-tip-btns { display: flex; gap: 6px; margin-top: 6px; }
+.ocr-tip button {
+  font: inherit; font-size: 11px; padding: 2px 8px; border-radius: 5px; cursor: pointer;
+  border: 1px solid #e0b872; background: #fff; color: #8a5a00;
+}
+.ocr-tip button:hover { background: #fff3dc; }
+.ocr-tip button.ghost { border-color: var(--line-strong); color: var(--muted); }
+.btn.active { background: var(--primary-weak); border-color: #c7dbfb; color: var(--primary); }
+
 /* ---- 属性面板 */
 #props { padding: 12px; }
 .field { margin-bottom: 11px; }
@@ -340,6 +355,7 @@ button { font: inherit; }
 .color-row { display: flex; gap: 6px; align-items: center; }
 .color-row input[type="color"] { width: 34px; height: 30px; padding: 2px; border: 1px solid var(--line-strong); border-radius: 6px; background: #fff; }
 .hint { font-size: 11px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
+.hint.warn { color: #8a5a00; background: #fffaf0; border: 1px dashed #e0b872; border-radius: 6px; padding: 6px 8px; }
 .actions { display: flex; gap: 8px; margin-top: 14px; }
 .actions .btn { flex: 1; }
 

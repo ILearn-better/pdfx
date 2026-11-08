@@ -1127,7 +1127,8 @@ async function main() {
     `${ocrAfter.ocrTag} 行 OCR｜${ocrAfter.toast}`);
   await shot('ocr-manual');
 
-  // 识别之后再改内容：旧识别框和画面已经对不上，应当自动收起（而不是继续拿旧框框字）
+  // 识别之后再改内容：旧识别框和画面已经对不上，但开不开是用户的开关 ——
+  // 程序只提示"框可能偏了"，不许自己关掉，也不许偷偷重跑整页识别。
   const ocrStale = await ev(`(async () => {
     const mk = (t, x, y, b, pid) => new PointerEvent(t, { clientX: x, clientY: y, bubbles: true, cancelable: true, pointerId: pid, pointerType: 'mouse', isPrimary: true, button: 0, buttons: b });
     document.querySelector('[data-tool="draw"]').click();
@@ -1139,14 +1140,60 @@ async function main() {
     await new Promise((z) => setTimeout(z, 2200));
     return {
       ocrTag: document.querySelectorAll('#objlist .tag.ocr').length,
-      strokes: document.querySelectorAll('#objlist .obj').length,
+      rows: document.querySelectorAll('#objlist .obj').length,
       btn: (document.querySelector('#btn-ocr') || {}).textContent,
+      tip: !!document.querySelector('#objlist .ocr-tip'),
+      tipText: (document.querySelector('#objlist .ocr-tip') || {}).textContent || '',
       toast: (document.querySelector('#toast') || {}).textContent,
     };
   })()`);
-  check('改完页面内容后旧 OCR 结果自动收起', ocrStale.ocrTag === 0,
+  check('改完内容后 OCR 仍然开着（不替用户关）', ocrStale.ocrTag > 0,
     `OCR 行 ${ocrStale.ocrTag}｜${ocrStale.toast}`);
-  check('收起后按钮回到「识别本页」', /识别本页/.test(String(ocrStale.btn)), String(ocrStale.btn));
+  check('改完内容后按钮变成「刷新识别」', /刷新识别/.test(String(ocrStale.btn)), String(ocrStale.btn));
+  check('对象面板给出「刷新识别 / 收起」提示', ocrStale.tip && /刷新识别/.test(ocrStale.tipText),
+    ocrStale.tipText.slice(0, 40));
+
+  // 过期框不能拿去改：坐标是旧位图算的，redact 会抹到错误位置
+  const ocrLock = await ev(`(async () => {
+    document.querySelector('[data-tool="select"]').click();
+    const row = [...document.querySelectorAll('#objlist .obj')].find((e) => e.querySelector('.tag.ocr'));
+    if (!row) return { err: '列表里没有 OCR 行' };
+    row.click();
+    await new Promise((z) => setTimeout(z, 300));
+    const apply = document.querySelector('#p-apply');
+    const hint = (document.querySelector('#p-hint') || {}).textContent || '';
+    return { disabled: !!(apply && apply.disabled), hasApply: !!apply, hint };
+  })()`);
+  check('过期的 OCR 行不能编辑（按钮禁用 + 提示刷新）',
+    ocrLock.hasApply && ocrLock.disabled && /刷新识别/.test(String(ocrLock.hint)),
+    ocrLock.err || ocrLock.hint.slice(0, 40));
+
+  const ocrRefresh = await ev(`(async () => {
+    document.querySelector('#tip-ocr-refresh').click();
+    for (let i = 0; i < 80; i++) {
+      await new Promise((z) => setTimeout(z, 250));
+      if (!document.querySelector('#objlist .ocr-tip')) break;
+    }
+    return {
+      ocrTag: document.querySelectorAll('#objlist .tag.ocr').length,
+      btn: (document.querySelector('#btn-ocr') || {}).textContent,
+      tip: !!document.querySelector('#objlist .ocr-tip'),
+    };
+  })()`);
+  check('点「刷新识别」后重算、提示消失', ocrRefresh.ocrTag > 0 && !ocrRefresh.tip,
+    `OCR 行 ${ocrRefresh.ocrTag}｜按钮 ${ocrRefresh.btn}`);
+
+  const ocrOff = await ev(`(async () => {
+    document.querySelector('#btn-ocr').click();
+    await new Promise((z) => setTimeout(z, 1200));
+    return {
+      ocrTag: document.querySelectorAll('#objlist .tag.ocr').length,
+      btn: (document.querySelector('#btn-ocr') || {}).textContent,
+    };
+  })()`);
+  check('点「收起识别」时 OCR 才真的关掉', ocrOff.ocrTag === 0,
+    `OCR 行 ${ocrOff.ocrTag}｜按钮 ${ocrOff.btn}`);
+  check('收起后按钮回到「识别本页」', /识别本页/.test(String(ocrOff.btn)), String(ocrOff.btn));
 
   console.log(`\n合计 ${pass} 项通过，${fail} 项失败`);
   if (errors.length) {
