@@ -866,12 +866,15 @@ async function main() {
     document.querySelector('#btn-keys').click();
     await new Promise((z) => setTimeout(z, 320));
     const p = document.querySelector('#keys-panel');
+    const cv = document.querySelector('#pages .pbox.current canvas');
     return {
       open: document.querySelector('.layout').classList.contains('keys-open'),
       width: Math.round(p.getBoundingClientRect().width),
       rows: document.querySelectorAll('#keys-body .krow').length,
       labels: [...document.querySelectorAll('#keys-body .kdesc')].map((e) => e.textContent),
       saved: localStorage.getItem('pdfx.keys'),
+      // 画布变窄之后，canvas 的内部像素尺寸必须跟着重设，否则位图被 CSS 拉伸变形
+      canvasSynced: cv ? Math.abs(cv.width - Math.round(cv.clientWidth * devicePixelRatio)) <= 1 : null,
     };
   })()`);
   check('点快捷键按钮能展开侧栏', panel.open === true && panel.width > 200,
@@ -880,6 +883,8 @@ async function main() {
   check('侧栏包含复制/粘贴/删除/撤销', ['粘贴剪贴板里的图片', '删除选中对象', '撤销', '复制选中的图片 / 文字']
     .every((t) => panel.labels.includes(t)), JSON.stringify(panel.labels));
   check('展开状态记到了本地（刷新后仍在）', panel.saved === '1', String(panel.saved));
+  check('展开后画布叠加层跟着重设尺寸（没有被拉伸）', panel.canvasSynced === true,
+    String(panel.canvasSynced));
   await shot('shortcut-panel');
 
   await press('Escape', 'Escape', 27);

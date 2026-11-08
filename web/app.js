@@ -2263,8 +2263,12 @@
     panel.classList.toggle('open', !!open);
     panel.setAttribute('aria-hidden', open ? 'false' : 'true');
     $('#btn-keys').classList.toggle('active', !!open);
-    // 面板宽度变了，画布可用宽度跟着变，重算叠加层坐标
-    requestAnimationFrame(() => { drawOverlay(); });
+    // 面板宽度变了，画布可用宽度跟着变：动画结束必须再画一次，
+    // 否则 canvas 位图会被 CSS 拉伸，选框和笔迹一时对不上位置
+    requestAnimationFrame(() => {
+      drawOverlay();
+      setTimeout(drawOverlay, 220);
+    });
     try { localStorage.setItem('pdfx.keys', open ? '1' : '0'); } catch (e) { /* 隐私模式 */ }
   }
 
@@ -2302,6 +2306,15 @@
   });
 
   window.addEventListener('resize', () => { drawOverlay(); });
+  /* 画布尺寸变了（展开侧栏、窗口缩放、面板折叠）都要重画叠加层：
+     canvas 的内部像素尺寸是 drawOverlay 自己设的，只靠 CSS 改宽度会被拉伸变形。 */
+  if (typeof ResizeObserver !== 'undefined') {
+    let roTimer = 0;
+    new ResizeObserver(() => {
+      clearTimeout(roTimer);
+      roTimer = setTimeout(() => drawOverlay(), 60);
+    }).observe(wrap);
+  }
 
   /* ------------------------------------------------------------------ 启动 */
   /* 前后端版本握手：前端是静态文件，刷新即新版；后端不会。

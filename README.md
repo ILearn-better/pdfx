@@ -313,7 +313,7 @@ python tools/install_skill.py
 python tools/make_samples.py     # 生成三类样本（结构化 / 扫描 / 混合）
 python tools/selftest.py         # 端到端 68 项，纯 Python API
 python tools/api_smoke.py        # HTTP 31 项，自动起停独立服务
-node   tools/uitest.mjs          # 界面 74 项，真实浏览器点击/拖拽/触摸（需 node 18+ 与 Edge/Chrome）
+node   tools/uitest.mjs          # 界面 75 项，真实浏览器点击/拖拽/触摸（需 node 18+ 与 Edge/Chrome）
 python tools/bench.py            # 性能基准（不是断言，用来看数字有没有退化）
 ```
 
@@ -346,7 +346,8 @@ python tools/bench.py            # 性能基准（不是断言，用来看数字
   - `Ctrl+C` 必须有反馈；随后一次空剪贴板的 `Ctrl+V` 要能再贴一张（应用内兜底路径）
   - Delete 键删完，用户图片数量必须少一个（不断言删的是哪一张：两张粘贴图可能重叠）
   - 快捷键侧栏必须列出复制/粘贴/删除/撤销四条，展开时面板宽度 > 200px，`Esc`/`?`/`F1` 都能开关，
-    开关状态写进 localStorage
+    开关状态写进 localStorage；展开后 canvas 内部像素尺寸必须跟新的 clientWidth 对齐
+    —— 只改 CSS 宽度不重设位图，选框会被横向拉伸
     —— 两处共用同一个图像资源，redaction 删资源会把两处一起抹掉
   - 打开扫描件时对象列表里**不能出现 OCR 行**，点「识别本页」之后才允许出现
   - 橡皮扫过正文之后，页面深色像素数、文本条数都必须**完全不变**，只有笔迹被切断
