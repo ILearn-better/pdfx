@@ -35,6 +35,7 @@
     pan: null,
     pendingImage: null,
     busy: false,
+    ctxSeq: 0,            // 文档/页面上下文版本：异步请求回来时校验，别把 A 页对象画到 B 页
     rev: 1,               // 后端文档修订号：内容一变就变，位图 URL 用它做缓存键
     sid: '',              // 后端进程标识：重启后换掉，避免拿到上次进程的缓存位图
     ocrPages: new Set(),  // 用户主动开了 OCR 的页 —— 开不开只由用户决定
@@ -47,7 +48,38 @@
 
   const wrap = $('#stage-wrap');
   const pagesBox = $('#pages');
-  const pxPerPt = () => S.zoom * PX_PER_PT;
+
+  /* 布局阶段用理论比例：此时 DOM 还不存在，没法实测。 */
+  const layoutScale = () => S.zoom * PX_PER_PT;
+
+  /* 绘制 / 命中阶段一律用「当前页实际显示宽度 ÷ 页面 pt 宽度」。
+     页面位图是被拉到 100% 铺满 .pbox 的，所以这个实测比例才是位图上
+     每 pt 对应多少 CSS px。以前写死 zoom*96/72，一旦 box 的实际宽度和
+     理论值有出入（浏览器缩放、系统 DPI、侧栏挤压、尺寸取整），叠加层就
+     和位图差开 —— 表现就是"笔画和图片对不上、笔画跳到旁边"。
+     实测值只依赖 DOM，跟设备参数无关，两台机器结果一致。 */
+  let kCache = { stamp: -1, key: '', k: layoutScale() };
+  function pxPerPt() {
+    const box = currentBox();
+    if (!box) return layoutScale();
+    const w = sizeOf(S.page)[0];
+    const key = `${S.doc}|${S.page}|${S.zoom}|${S.ctxSeq}|${w}`;
+    // 一帧（16ms）只量一次：rectOf 在 OCR 结果几百行时每帧会调几百次，
+    // 每次 getBoundingClientRect 都会强制同步布局，直接把画笔拖垮。
+    const stamp = Math.floor(performance.now() / 16);
+    if (kCache.key === key && kCache.stamp === stamp) return kCache.k;
+    const r = box.getBoundingClientRect();
+    const k = r.width > 0 && w > 0 ? r.width / w : layoutScale();
+    kCache = { stamp, key, k };
+    return k;
+  }
+
+  /* 异步操作开始前抓一份上下文。请求飞在路上的时候用户可能已经翻页，
+     回来时若不校验，A 页的图片/笔迹就会被写进 B 页的 S.objs。 */
+  function ctxNow() { return { doc: S.doc, page: S.page, seq: S.ctxSeq }; }
+  function ctxSame(c) {
+    return !!c && c.doc === S.doc && c.page === S.page && c.seq === S.ctxSeq;
+  }
 
   /* ------------------------------------------------------------------ 基础工具 */
   function toast(msg, kind = '') {
@@ -256,6 +288,19 @@
     { root: wrap, rootMargin: '700px 0px' }
   );
 
+  /* 按「布局比例」定 .pbox 的尺寸。不取整：位图会被拉到 100% 铺满，
+     宽高都按同一个 k 生成，实测比例才严格等于 k（相差不到 0.01px）。
+     以前 Math.round 会让宽、高比例各差一点，位图被非等比拉伸，
+     叠加层却按理论 k 画 —— DPI/缩放一变，笔画就跟图片错开。 */
+  function sizeBox(i, el) {
+    const box = el || pagesBox.querySelector(`.pbox[data-page="${i}"]`);
+    if (!box) return;
+    const [w, h] = sizeOf(i);
+    const k = layoutScale();
+    box.style.width = Math.max(1, w * k).toFixed(2) + 'px';
+    box.style.height = Math.max(1, h * k).toFixed(2) + 'px';
+  }
+
   function renderPages() {
     io.disconnect();
     pagesBox.innerHTML = '';
@@ -264,14 +309,11 @@
       return;
     }
     const list = S.view === 'single' ? [S.page] : Array.from({ length: S.pageCount }, (_, i) => i);
-    const k = pxPerPt();
     list.forEach((i) => {
-      const [w, h] = sizeOf(i);
       const box = document.createElement('div');
       box.className = 'pbox' + (i === S.page ? ' current' : '');
       box.dataset.page = i;
-      box.style.width = Math.max(1, Math.round(w * k)) + 'px';
-      box.style.height = Math.max(1, Math.round(h * k)) + 'px';
+      sizeBox(i, box);
 
       const im = document.createElement('img');
       im.alt = '';
@@ -323,6 +365,7 @@
     if (!S.doc) return;
     if (!force && (n < 0 || n >= S.pageCount)) return;
     const changed = n !== S.page;
+    if (changed) S.ctxSeq += 1;   // 让飞在路上的旧页请求失效
     S.page = n;
     S.sel = null;
     S.drawing = null;
@@ -481,6 +524,7 @@
 
   /* ------------------------------------------------------------------ 文档装载 */
   async function loadInfo(info) {
+    S.ctxSeq += 1;            // 换文档：旧文档在飞的请求一律不许落地
     S.doc = info.doc_id || info.doc || S.doc;
     S.path = info.path || null;
     // 换文档时修订号必须归零重来：rev 是"每份文档各自"的计数，
@@ -547,24 +591,37 @@
     return S.forceOcr || (ocrOn() && !ocrStale());
   }
 
+  let objReq = 0;
   async function refreshObjects() {
     if (!S.doc) return;
+    const token = ++objReq;          // 只有最后一次对象请求能落地
+    const c = ctxNow();              // 以及它出发时的文档/页面
+    const run = wantOcr();
     try {
-      const run = wantOcr();
-      const objs = await api(`/api/page/${S.page}/objects?ocr=${run ? 1 : 0}`);
+      const objs = await api(`/api/page/${c.page}/objects?ocr=${run ? 1 : 0}`);
+      /* 请求飞在路上的时候翻了页/换了文档，旧响应绝不能写入 S.objs：
+         以前会把 A 页的图片、笔迹画到 B 页上（"笔画和图片乱在一起、
+         笔画跳到别的位置"），慢设备上更容易撞上。后端是单锁串行处理，
+         慢页的响应晚到是常态，不是偶发。 */
+      if (token !== objReq || !ctxSame(c)) return;
+      if (Number.isInteger(objs.page) && objs.page !== c.page) return;
+      const size = Array.isArray(objs.size) && objs.size.length === 2 ? objs.size : S.size;
+      // 尺寸按「请求的那一页」存。写成 S.sizes[S.page] 会把 A 页尺寸
+      // 记到 B 页名下，之后 B 页位图被按错误比例拉伸，叠加层全跟着偏。
+      S.sizes[c.page] = size;
+      sizeBox(c.page);
       let texts = objs.texts.items;
       // 开着 OCR 但框已过期：不重跑（整页 1~3 秒），也不把它关掉，
       // 上一轮识别结果原样留着，用户点了「刷新识别」才重算。
       // 取缓存时必须按页取 —— 翻页后 S.objs 已经是别页的了。
       if (ocrOn() && !run) {
-        const keep = S.ocrCache.get(S.page) || [];
+        const keep = S.ocrCache.get(c.page) || [];
         if (keep.length) texts = texts.concat(keep);
       }
       S.objs = { texts, images: objs.images.items, strokes: objs.strokes.items };
       // 真正跑过识别：把这一页的结果记下来，之后改内容/翻页回来都还有框可看
-      if (run) S.ocrCache.set(S.page, texts.filter((t) => t.source === 'ocr'));
-      S.size = objs.size;
-      S.sizes[S.page] = objs.size;
+      if (run) S.ocrCache.set(c.page, texts.filter((t) => t.source === 'ocr'));
+      S.size = size;
       S.type = objs.type;
       $('#page-type').textContent = { text: '结构化文本', scanned: '扫描件', mixed: '混合', empty: '空白页' }[objs.type] || objs.type;
       // 注意类名要加前缀：直接写 'pill empty' 会和页面上的空状态遮罩 .empty 撞名
@@ -574,7 +631,7 @@
       renderObjList();
       if (S.hits.length) renderResults();
     } catch (e) {
-      toast(e.message, 'err');
+      if (token === objReq && ctxSame(c)) toast(e.message, 'err');
     }
   }
 
@@ -727,8 +784,12 @@
 
   function prepCtx(cvs) {
     if (!cvs) return null;
-    const w = cvs.clientWidth || 1;
-    const h = cvs.clientHeight || 1;
+    // clientWidth/Height 是取整后的整数，而 .pbox 用的是小数 px。
+    // 高 DPI（1.25 / 1.5 / 2）下这点差值会被 dpr 放大，画布内容相对
+    // 位图轻微错位。用浮点 rect 量，位图和 CSS 尺寸才严格一一对应。
+    const r = cvs.getBoundingClientRect();
+    const w = r.width || cvs.clientWidth || 1;
+    const h = r.height || cvs.clientHeight || 1;
     const dpr = window.devicePixelRatio || 1;
     const nw = Math.max(1, Math.round(w * dpr));
     const nh = Math.max(1, Math.round(h * dpr));
@@ -1122,19 +1183,22 @@
   /* 内容改了：这一页的识别框是按旧位图算的，位置可能对不上。
      但"开不开 OCR"是用户的开关 —— 不替他关，也不自动重跑（整页 1~3 秒）。
      只打一个"待刷新"标记，用户点「刷新识别」才重算，点「收起识别」才关掉。 */
-  function markOcrStale() {
-    if (!ocrOn() || S.ocrStale.has(S.page)) return;
-    S.ocrStale.add(S.page);
-    syncOcrButton();
-    renderObjList();
-    toast('这一页内容改过了，识别框可能偏了；点「刷新识别」重算，或「收起识别」关掉', '');
+  function markOcrStale(page = S.page) {
+    if (!S.ocrPages.has(page) || S.ocrStale.has(page)) return;
+    S.ocrStale.add(page);
+    if (page === S.page) {
+      syncOcrButton();
+      renderObjList();
+      toast('这一页内容改过了，识别框可能偏了；点「刷新识别」重算，或「收起识别」关掉', '');
+    }
   }
 
   async function afterContentChange(opts = {}) {
-    const { pageImage = true } = opts;
-    markOcrStale();
-    reloadThumb(S.page);
-    if (pageImage) reloadPageImage(S.page);
+    // 写操作期间可能已经翻页；改动属于哪一页要锁死，别把当前页误标成 OCR 过期、误刷缩略图
+    const { pageImage = true, page = S.page } = opts;
+    markOcrStale(page);
+    reloadThumb(page);
+    if (pageImage) reloadPageImage(page);
     requestAnimationFrame(renderDocList);
     await refreshObjects();
   }
@@ -1216,15 +1280,48 @@
   }
 
   /* ------------------------------------------------------------------ 画布交互 */
-  /* pointerdown 时缓存一次 rect：pointermove 里每帧都调 getBoundingClientRect()
-     会强制浏览器同步布局，是画笔"一卡一卡"的典型原因。 */
+  /* pointerdown 时缓存一次几何：pointermove 里每帧都调 getBoundingClientRect()
+     会强制浏览器同步布局，是画笔"一卡一卡"的典型原因。
+     但缓存也不能一直用 —— 手势中间滚动、缩放、侧栏展开都会让 rect 失效，
+     继续拿旧 rect 换算，后面每一个点都整体平移，看上去就是"笔画跳到别处"。
+     所以缓存里同时记下滚动位置 / zoom / 页面上下文，变了就校正或重测。 */
   let baseRect = null;
+
+  function measureBase(box) {
+    const b = box || currentBox();
+    if (!b) { baseRect = null; return; }
+    const r = b.getBoundingClientRect();
+    const pi = Number.isInteger(+b.dataset.page) ? +b.dataset.page : S.page;
+    const [w, h] = sizeOf(pi);
+    baseRect = {
+      box: b,
+      left: r.left, top: r.top,
+      // 用实测比例，不用理论 zoom：位图被拉到 100% 铺满 box，
+      // box 的实际宽高才决定每 pt 对应多少 CSS px
+      sx: r.width > 0 && w > 0 ? r.width / w : layoutScale(),
+      sy: r.height > 0 && h > 0 ? r.height / h : layoutScale(),
+      sl: wrap.scrollLeft, st: wrap.scrollTop,
+      zoom: S.zoom, doc: S.doc, page: S.page, seq: S.ctxSeq,
+    };
+  }
 
   function toPdf(ev, box) {
     const b = box || currentBox();
     if (!b) return [0, 0];
-    const r = baseRect || b.getBoundingClientRect();
-    return [(ev.clientX - r.left) / pxPerPt(), (ev.clientY - r.top) / pxPerPt()];
+    let m = baseRect;
+    if (!m || m.box !== b || !m.box.isConnected || m.zoom !== S.zoom
+        || m.doc !== S.doc || m.page !== S.page || m.seq !== S.ctxSeq) {
+      measureBase(b);
+      m = baseRect;
+    } else if (m.sl !== wrap.scrollLeft || m.st !== wrap.scrollTop) {
+      // 滚动只平移 rect，不改变宽高比例：按增量修正，不重新触发布局
+      m.left -= wrap.scrollLeft - m.sl;
+      m.top -= wrap.scrollTop - m.st;
+      m.sl = wrap.scrollLeft;
+      m.st = wrap.scrollTop;
+    }
+    if (!m) return [0, 0];
+    return [(ev.clientX - m.left) / m.sx, (ev.clientY - m.top) / m.sy];
   }
 
   function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
@@ -1298,7 +1395,9 @@
     const wr = wrap.getBoundingClientRect();
     const cx = clamp(wr.left + wr.width / 2 - br.left, 0, br.width);
     const cy = clamp(wr.top + wr.height / 2 - br.top, 0, br.height);
-    return [cx / pxPerPt(), cy / pxPerPt()];
+    const sx = br.width > 0 ? br.width / size[0] : pxPerPt();
+    const sy = br.height > 0 ? br.height / size[1] : pxPerPt();
+    return [cx / sx, cy / sy];
   }
 
   /* 采样：距离太近的点丢掉，既不抖也不浪费 */
@@ -1359,7 +1458,7 @@
       await setCurrentPage(idx, { scroll: false });
       return;
     }
-    baseRect = box.getBoundingClientRect();
+    measureBase(box);
     try { ev.target.setPointerCapture?.(ev.pointerId); } catch (e) { /* 合成事件没有真实 pointerId */ }
     const pt = toPdf(ev, box);
 
@@ -1535,6 +1634,10 @@
      不收拾的话这一笔既不会落库、状态还会一直悬着。 */
   async function endGesture(ev) {
     if (!S.doc) return;
+    /* 这一笔/这次拖动属于哪一页，松手时就锁死。中间两个 await 之间用户
+       完全可能翻页或滚动到别页，旧代码在这时才去读 S.page，于是笔画
+       落到 A 页、对象列表却拉 B 页，或把 A 页的框贴到 B 页上。 */
+    const ctx = ctxNow();
     baseRect = null;
 
     if (S.pan) { S.pan = null; return; }
@@ -1549,18 +1652,17 @@
       S.objs.strokes.push(tmp);
       paint('both');
       try {
-        await api('/api/ink', { json: { page: S.page, strokes: [{ points: d.points, color: d.color, width: d.width }] } });
+        await api('/api/ink', { json: { page: ctx.page, strokes: [{ points: d.points, color: d.color, width: d.width }] } });
+        reloadThumb(ctx.page);
+        // 已经翻到别页：数据落库了，别再拿旧页对象去覆盖新页的 S.objs
+        if (!ctxSame(ctx)) return;
         markOcrStale();
-        const objs = await api(`/api/page/${S.page}/objects?ocr=0`);
+        // 把这一页的 OCR 行存进缓存，refreshObjects 才能原样带回来
         const keepOcr = (S.objs.texts || []).filter((t) => t.source === 'ocr');
-        S.objs.strokes = objs.strokes.items;
-        // 画笔不改文字：原生对象刷新，OCR 结果原样留着（开关是用户的，不替他收起）
-        S.objs.texts = objs.texts.items.concat(keepOcr);
-        paint('both');
-        renderObjList();
-        reloadThumb(S.page);
+        if (keepOcr.length) S.ocrCache.set(ctx.page, keepOcr);
+        await refreshObjects();
       } catch (e) {
-        S.objs.strokes = S.objs.strokes.filter((x) => x.id !== tmp.id);
+        if (ctxSame(ctx)) S.objs.strokes = S.objs.strokes.filter((x) => x.id !== tmp.id);
         paint('both');
         toast(e.message, 'err');
       }
@@ -1578,9 +1680,10 @@
         let cut = { removed: 0 };
         if ((S.objs.strokes || []).length) {
           cut = await api('/api/ink/erase', {
-            json: { page: S.page, points: e0.points, radius: e0.radius, mode: 'cut' },
+            json: { page: ctx.page, points: e0.points, radius: e0.radius, mode: 'cut' },
           });
         }
+        if (!ctxSame(ctx)) return;
         await afterContentChange();
         toast(cut.removed ? `已擦除笔迹 ${cut.removed} 处` : '这里没有可擦除的笔迹',
           cut.removed ? 'ok' : '');
@@ -1598,7 +1701,7 @@
       paint('live');
       // 只是点了一下（没拖出框）：在点击处放一个默认大小的文本框
       if (rect[2] - rect[0] < 8 || rect[3] - rect[1] < 8) rect = defaultTextBox(d.a);
-      await placeText(rect);
+      await placeText(rect, ctx);
       return;
     }
 
@@ -1606,7 +1709,7 @@
       const d = S.drag;
       if (d.moved) {
         // 故意不清 S.drag：预览要一直停在松手的位置，等新位图就绪由 commitDrag 收尾
-        await commitDrag(d);
+        await commitDrag(d, ctx);
       } else {
         S.drag = null;
         paint('both');
@@ -1625,13 +1728,17 @@
   }
 
   /* 增：文本框 */
-  async function placeText(rect) {
+  async function placeText(rect, ctx = null) {
+    const c = ctx || ctxNow();
     const text = await askText('', '输入要插入的文字');
     if (!text || !text.trim()) return;
     try {
+      // rect 是按落笔那一页的坐标系算出来的，page 必须用同一页；
+      // 弹窗输入期间翻了页还读 S.page，文字就会出现在别页的错误位置。
       const rec = await api('/api/text', {
-        json: { page: S.page, text, rect, font_size: S.textStyle.size, color: S.textStyle.color },
+        json: { page: c.page, text, rect, font_size: S.textStyle.size, color: S.textStyle.color },
       });
+      if (!ctxSame(c)) { setTool('select'); return; }
       await afterContentChange();
       if (rec) {
         S.sel = { kind: 'text', ...rec, source: 'user', size: S.textStyle.size };
@@ -1658,18 +1765,22 @@
      插入位置是当前视口中心，按原比例、最大占页宽 55% / 页高 60%。 */
   async function insertImageData(dataUrl, name) {
     if (!S.doc) { toast('先打开或新建一个文档', 'err'); return null; }
+    const ctx = ctxNow();
     const dim = await imageSizeOf(dataUrl);
-    const [pw, ph] = sizeOf(S.page);
+    // 等图片解码期间翻了页，就不要按新页的视口中心算坐标了
+    if (!ctxSame(ctx)) { toast('页面已切换，请重新插入图片', ''); return null; }
+    const [pw, ph] = sizeOf(ctx.page);
     // 像素按 96dpi 换成 pt，太大就缩到页面宽度的 55%
     let w = Math.min((dim.w * 72) / 96, pw * 0.55);
     let h = w * (dim.h / Math.max(1, dim.w));
     if (h > ph * 0.6) { h = ph * 0.6; w = h * (dim.w / Math.max(1, dim.h)); }
-    const c = viewCenterPt();
-    const rect = clampBbox([c[0] - w / 2, c[1] - h / 2, c[0] + w / 2, c[1] + h / 2]);
+    const center = viewCenterPt();
+    const rect = clampBbox([center[0] - w / 2, center[1] - h / 2, center[0] + w / 2, center[1] + h / 2]);
     try {
       const rec = await api('/api/image', {
-        json: { page: S.page, rect, data_url: dataUrl, name },
+        json: { page: ctx.page, rect, data_url: dataUrl, name },
       });
+      if (!ctxSame(ctx)) { setTool('select'); return rec; }
       await afterContentChange();
       if (rec) {
         S.sel = { kind: 'image', ...rec, source: 'user' };
@@ -1695,7 +1806,8 @@
 
   /* 移动 / 缩放的提交：松手才落库，过程中只在画布上预览。
      预览一直保留到新位图就绪（settlePageImage），避免松手瞬间弹回原位。 */
-  async function commitDrag(d) {
+  async function commitDrag(d, ctx = null) {
+    const c = ctx || ctxNow();
     const o = d.obj;
     if (!o) { S.drag = null; paint('both'); return; }
     // 只有文本和图片支持变换，别的类型直接放弃预览
@@ -1714,17 +1826,20 @@
         res = await api('/api/text', {
           method: 'PUT',
           json: {
-            page: S.page, id: o.id, rect,
+            page: c.page, id: o.id, rect,
             font_size: d.kind === 'resize' ? d.fontSize : (o.size || undefined),
           },
         });
       } else {
         res = await api('/api/image', {
           method: 'PUT',
-          json: { page: S.page, id: o.id, rect, keep_ratio: d.kind === 'resize' ? d.keep : true },
+          json: { page: c.page, id: o.id, rect, keep_ratio: d.kind === 'resize' ? d.keep : true },
         });
       }
-      await afterContentChange();
+      await afterContentChange({ page: c.page });
+      // 中途翻了页：下面要拿 S.objs（已经是新页的）去重新定位旧页对象，
+      // 会把新页某个不相干的对象选中。直接收起预览即可。
+      if (!ctxSame(c)) { S.drag = null; paint('both'); return; }
       // 变换后 id 可能变（原生文本按坐标编号），用"内容 + 中心点最近"重新定位选中项，
       // 这样连续拖两次手柄不会因为丢选中而变成拖动
       const items = o.kind === 'text' ? S.objs.texts : S.objs.images;
@@ -1752,7 +1867,7 @@
       toast(d.kind === 'move' ? '已移动' : '已调整大小', 'ok');
     } catch (e) {
       toast(e.message, 'err');
-      await afterContentChange();
+      await afterContentChange({ page: c.page });
       await settlePageImage();
       S.drag = null;
       paint('both');
@@ -2166,13 +2281,10 @@
   /* 缩放时先只改盒子尺寸（立刻跟手），位图换高清版本防抖 160ms 再做。
      原来每次滚轮/点按都重建整个 DOM + 重新请求全部位图，连续缩放就是灾难。 */
   function applyZoomLayout() {
-    const k = pxPerPt();
-    pagesBox.querySelectorAll('.pbox').forEach((box) => {
-      const i = +box.dataset.page;
-      const [w, h] = sizeOf(i);
-      box.style.width = Math.max(1, Math.round(w * k)) + 'px';
-      box.style.height = Math.max(1, Math.round(h * k)) + 'px';
-    });
+    // 这里必须用「新的理论比例」重排，不能调实测的 pxPerPt()：
+    // 那个值量的是旧 box，zoom 刚变时还是旧比例，会把缩放卡住。
+    pagesBox.querySelectorAll('.pbox').forEach((box) => sizeBox(+box.dataset.page, box));
+    baseRect = null;
     drawOverlay();
   }
 
@@ -2428,14 +2540,16 @@
     }
   });
 
-  window.addEventListener('resize', () => { drawOverlay(); });
+  window.addEventListener('resize', () => { baseRect = null; drawOverlay(); });
   /* 画布尺寸变了（展开侧栏、窗口缩放、面板折叠）都要重画叠加层：
-     canvas 的内部像素尺寸是 drawOverlay 自己设的，只靠 CSS 改宽度会被拉伸变形。 */
+     canvas 的内部像素尺寸是 drawOverlay 自己设的，只靠 CSS 改宽度会被拉伸变形。
+     同时让指针几何缓存失效 —— 侧栏一展开，页面整体横移，旧 rect 会让
+     手势中后续的采样点全偏到旁边。 */
   if (typeof ResizeObserver !== 'undefined') {
     let roTimer = 0;
     new ResizeObserver(() => {
       clearTimeout(roTimer);
-      roTimer = setTimeout(() => drawOverlay(), 60);
+      roTimer = setTimeout(() => { baseRect = null; drawOverlay(); }, 60);
     }).observe(wrap);
   }
 

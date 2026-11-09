@@ -249,7 +249,9 @@ button { font: inherit; }
   position: relative; background: #fff; flex: none;
   box-shadow: 0 2px 18px rgba(16,24,40,.14);
 }
-.pbox img { display: block; width: 100%; height: 100%; user-select: none; -webkit-user-drag: none; }
+/* fill = 把位图拉满整个框。叠加层也是按框宽高换算 PDF 点的，
+   若这里被浏览器/扩展改成 contain 留白，笔画就会跟页面内容错开。 */
+.pbox img { display: block; width: 100%; height: 100%; object-fit: fill; user-select: none; -webkit-user-drag: none; }
 /* 两层画布都不接事件：指针统一落到 img 上，由 .pbox 统一分发，
    避免"画到一半事件被另一层抢走"这类问题 */
 .pbox canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }

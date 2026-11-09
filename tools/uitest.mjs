@@ -626,20 +626,42 @@ async function main() {
       .filter((it) => it.source === 'user').pop();
     const nb = cur ? cur.bbox : null;
     const d = g.getImageData(x, y, w, h).data;
+    const isBlue = (i) => d[i + 2] > 150 && d[i] < 110 && d[i + 1] < 160;
     let blue = 0, seen = 0;
     for (let py = 0; py < h; py++) {
       for (let px = 0; px < w; px++) {
         const ax = x + px, ay = y + py;
         if (nb && ax >= nb[0] && ax <= nb[2] && ay >= nb[1] && ay <= nb[3]) continue;
         seen++;
-        const i = (py * w + px) * 4;
-        if (d[i + 2] > 150 && d[i] < 110 && d[i + 1] < 160) blue++;
+        if (isBlue((py * w + px) * 4)) blue++;
       }
     }
-    return { blue, total: seen };
+    /* 样例 PDF 自带蓝色波浪线/笔迹，单看"蓝色像素占比"会把它误判成
+       图片残影（页面位图缩放差 0.1% 就会让比例在 2% 阈值上下跳）。
+       残影是整片实心矩形，按 8×8 小块统计密度：真残影会出现大量
+       高密块，细线哪怕横穿整块也远到不了 75%。 */
+    let dense = 0, cells = 0;
+    const cell = 8;
+    for (let cy = 0; cy + cell <= h; cy += cell) {
+      for (let cx = 0; cx + cell <= w; cx += cell) {
+        let n = 0, hit = 0;
+        for (let py = 0; py < cell; py++) {
+          for (let px = 0; px < cell; px++) {
+            const ax = x + cx + px, ay = y + cy + py;
+            if (nb && ax >= nb[0] && ax <= nb[2] && ay >= nb[1] && ay <= nb[3]) continue;
+            n++;
+            if (isBlue(((cy + py) * w + cx + px) * 4)) hit++;
+          }
+        }
+        // 只认"几乎整块都是实心蓝"的格子：贴着新图边界的块被排除后
+        // 只剩几个像素，比例容易虚高，用绝对数量卡住才不会被噪声带偏。
+        if (n >= 56) { cells++; if (hit >= 48) dense++; }
+      }
+    }
+    return { blue, total: seen, dense, cells };
   })()`);
-  check('移动后原位没有图片残影', ghost.blue != null && ghost.total > 0 && ghost.blue / ghost.total < 0.02,
-    ghost.err || `原位蓝色像素 ${ghost.blue} / ${ghost.total}（${(100 * ghost.blue / Math.max(1, ghost.total)).toFixed(1)}%）`);
+  check('移动后原位没有图片残影', ghost.dense != null && ghost.cells > 0 && ghost.dense === 0,
+    ghost.err || `原位实心蓝块 ${ghost.dense}/${ghost.cells}｜蓝色像素 ${ghost.blue}/${ghost.total}`);
 
   // ---- 删除图片 → 还能不能再插回来 ----
   // 曾经的死结：删除只是拿纸色块盖住，旧图仍留在内容流里；再往同一处插新图时，
@@ -1217,6 +1239,169 @@ async function main() {
     `OCR 行 ${ocrOff.ocrTag}｜按钮 ${ocrOff.btn}`);
   check('收起后按钮回到「识别本页」', /识别本页/.test(String(ocrOff.btn)), String(ocrOff.btn));
   check('收起后顶栏开关回到「本页 OCR 关」', /OCR\s*关/.test(String(ocrOff.top)), String(ocrOff.top));
+
+  /* ------------------------------------------------------------------
+     跨设备一致性：新设备上报"笔画和图片乱在一起、笔画跳到别处"。
+     这类问题只在设备参数/时序变了才出现，所以要显式把 DPI、滚动、
+     并发翻页都拉出来测，而不是只在一个 1440×900 / dpr=1 的环境里跑。 */
+  console.log('\n== 跨设备：DPI / 滚动 / 并发翻页 ==');
+  await ev(`(async () => {
+    const items = [...document.querySelectorAll('#doclist .docitem')];
+    const d = items.find((el) => /未命名/.test(el.textContent));
+    if (d) d.click();
+    for (let i = 0; i < 40; i++) {
+      if (+document.querySelector('#page-count').textContent >= 3) break;
+      await new Promise(z => setTimeout(z, 150));
+    }
+    const cont = document.querySelector('[data-view="cont"]');
+    if (cont) cont.click();
+    await new Promise(z => setTimeout(z, 500));
+    document.querySelector('#stage-wrap').scrollTop = 0;
+  })()`);
+  const multiPage = await ev(`+document.querySelector('#page-count').textContent`);
+  check('已切到多页文档（并发翻页的前提）', multiPage >= 3, `${multiPage} 页`);
+
+  const dpiRuns = [];
+  for (const dpr of [1, 1.25, 1.5, 2]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: 1440, height: 900, deviceScaleFactor: dpr, mobile: false,
+    });
+    await sleep(300);
+    const r = await ev(`(async () => {
+      const box = document.querySelector('#pages .pbox.current');
+      const im = box && box.querySelector('img');
+      if (!im) return { err: 'no page' };
+      const rect = im.getBoundingClientRect();
+      const pno = +box.dataset.page;
+      const doc = (await (await fetch('/api/docs')).json()).data.current;
+      const url = '/api/page/' + pno + '/objects?ocr=0&doc=' + doc;
+      const before = (await (await fetch(url)).json()).data.strokes.count;
+      const mk = (t, x, y, b) => new PointerEvent(t, {
+        clientX: x, clientY: y, bubbles: true, cancelable: true,
+        pointerId: 131, pointerType: 'mouse', isPrimary: true, button: 0, buttons: b });
+      document.querySelector('[data-tool="draw"]').click();
+      im.dispatchEvent(mk('pointerdown', rect.left + 120, rect.top + 300, 1));
+      im.dispatchEvent(mk('pointermove', rect.left + 180, rect.top + 330, 1));
+      im.dispatchEvent(mk('pointerup', rect.left + 180, rect.top + 330, 0));
+      await new Promise(z => setTimeout(z, 1100));
+      const after = (await (await fetch(url)).json()).data;
+      const last = after.strokes.items[after.strokes.items.length - 1];
+      return { first: last && last.points[0], before, after: after.strokes.count,
+               rw: rect.width, rh: rect.height, size: after.size, dpr: window.devicePixelRatio };
+    })()`);
+    dpiRuns.push({ dpr, ...r });
+  }
+  const dpiErr = dpiRuns.map((r) => r.first
+    ? Math.max(Math.abs(r.first[0] - 120 / (r.rw / r.size[0])),
+               Math.abs(r.first[1] - 300 / (r.rh / r.size[1])))
+    : 99);
+  check('不同 DPI 下画笔都落在指针位置（不漂移）',
+    dpiRuns.every((r) => r.after > r.before) && dpiErr.every((e) => e < 1.5),
+    dpiRuns.map((r) => `${r.dpr}x:${r.first ? dpiErr[dpiRuns.indexOf(r)].toFixed(2) : 'n/a'}pt`).join(' '));
+  const xs = dpiRuns.map((r) => r.first && r.first[0]).filter((v) => v != null);
+  const ys = dpiRuns.map((r) => r.first && r.first[1]).filter((v) => v != null);
+  check('1x / 1.25x / 1.5x / 2x 落点完全一致',
+    xs.length === 4 && Math.max(...xs) - Math.min(...xs) < 1.5
+      && Math.max(...ys) - Math.min(...ys) < 1.5,
+    `x ${xs.map((v) => v.toFixed(1)).join('/')} · y ${ys.map((v) => v.toFixed(1)).join('/')}`);
+  await cdp.send('Emulation.setDeviceMetricsOverride', {
+    width: 1440, height: 900, deviceScaleFactor: 1, mobile: false,
+  });
+  await sleep(250);
+
+  // 手势中间页面滚动：缓存的 rect 必须跟着平移，否则后续采样点整体跳位
+  const scrollRun = await ev(`(async () => {
+    const wrap = document.querySelector('#stage-wrap');
+    const box = document.querySelector('#pages .pbox.current');
+    const im = box && box.querySelector('img');
+    if (!im) return { err: 'no page' };
+    wrap.scrollTop = 0;
+    await new Promise(z => setTimeout(z, 120));
+    const r = im.getBoundingClientRect();
+    const pno = +box.dataset.page;
+    const doc = (await (await fetch('/api/docs')).json()).data.current;
+    const url = '/api/page/' + pno + '/objects?ocr=0&doc=' + doc;
+    const size = (await (await fetch(url)).json()).data.size;
+    const sy = r.height / size[1];
+    const mk = (t, x, y, b) => new PointerEvent(t, {
+      clientX: x, clientY: y, bubbles: true, cancelable: true,
+      pointerId: 141, pointerType: 'mouse', isPrimary: true, button: 0, buttons: b });
+    document.querySelector('[data-tool="draw"]').click();
+    im.dispatchEvent(mk('pointerdown', r.left + 120, r.top + 300, 1));
+    const before = wrap.scrollTop;
+    wrap.scrollTop = before + 80;
+    await new Promise(z => setTimeout(z, 150));
+    // 手指停在原屏幕位置，页面往上滚了 80px
+    im.dispatchEvent(mk('pointermove', r.left + 180, r.top + 330, 1));
+    im.dispatchEvent(mk('pointerup', r.left + 180, r.top + 330, 0));
+    await new Promise(z => setTimeout(z, 1100));
+    const objs = (await (await fetch(url)).json()).data;
+    const st = objs.strokes.items[objs.strokes.items.length - 1];
+    const pts = st && st.points;
+    // 第一个点是落笔时的位置（滚动前），最后一个点是滚动之后的采样点。
+    // 只有后者该跟着页面一起下移 80px；前者必须原地不动。
+    return { first: pts && pts[0][1], last: pts && pts[pts.length - 1][1],
+             expectFirst: 300 / sy, expectLast: 410 / sy,
+             delta: wrap.scrollTop - before, sy };
+  })()`);
+  check('手势中滚动 80px 后笔画跟着页面走（不是跳位）',
+    !scrollRun.err && scrollRun.delta >= 70
+      && Math.abs(scrollRun.last - scrollRun.expectLast) < 3
+      && Math.abs(scrollRun.first - scrollRun.expectFirst) < 3,
+    scrollRun.err || `滚动 ${scrollRun.delta}px｜首点 ${scrollRun.first && scrollRun.first.toFixed(1)}/${scrollRun.expectFirst.toFixed(1)}`
+      + ` 末点 ${scrollRun.last && scrollRun.last.toFixed(1)}/${scrollRun.expectLast.toFixed(1)}`);
+
+  // 人为制造"旧页请求晚到"：慢设备上后端单锁串行时是常态
+  const race = await ev(`(async () => {
+    const orig = window.fetch.bind(window);
+    let n = 0;
+    window.fetch = (...a) => {
+      if (String(a[0]).includes('/objects')) {
+        const delay = (n++ === 0) ? 750 : 60;
+        return new Promise(res => setTimeout(() => res(orig(...a)), delay));
+      }
+      return orig(...a);
+    };
+    try {
+      const click = (i) => {
+        const b = document.querySelector('#thumbs .thumb-wrap[data-page="' + i + '"] .thumb');
+        if (b) b.click();
+      };
+      click(1);
+      click(2);
+      await new Promise(z => setTimeout(z, 1700));
+      const pageNow = +document.querySelector('#page-now').textContent - 1;
+      const curBox = +document.querySelector('#pages .pbox.current').dataset.page;
+      const doc = (await (await fetch('/api/docs')).json()).data.current;
+      const j = (await (await fetch('/api/page/' + pageNow + '/objects?ocr=0&doc=' + doc)).json()).data;
+      const total = j.texts.count + j.images.count + j.strokes.count;
+      const rows = document.querySelectorAll('#objlist .obj').length;
+      // 数量偶合不足以证明没串页，再比第一条文本的坐标
+      const firstText = j.texts.items[0] && j.texts.items[0].bbox;
+      const firstMeta = (document.querySelector('#objlist .obj .meta') || {}).textContent || '';
+      const info = (await (await fetch('/api/doc?doc=' + doc)).json()).data;
+      const sizes = (info.pages || []).map(p => p.size);
+      const ks = [...document.querySelectorAll('#pages .pbox')].map((b) => {
+        const i = +b.dataset.page;
+        return sizes[i] ? parseFloat(b.style.width) / sizes[i][0] : null;
+      }).filter((v) => v != null);
+      return { pageNow, curBox, total, rows, firstText, firstMeta, ks,
+               spread: ks.length ? Math.max(...ks) - Math.min(...ks) : 99 };
+    } finally {
+      window.fetch = orig;
+    }
+  })()`);
+  const coordOk = !race.firstText
+    || (race.firstMeta.includes(String(Math.round(race.firstText[0])))
+      && race.firstMeta.includes(String(Math.round(race.firstText[1]))));
+  check('旧页对象请求晚到也不会覆盖当前页（不串页）',
+    race.pageNow === race.curBox && race.rows === race.total && coordOk,
+    `当前页 ${race.pageNow}｜列表 ${race.rows} 行 / 接口 ${race.total} 个对象`
+      + `｜首条 ${race.firstText ? race.firstText.slice(0, 2).map(Math.round).join(',') : 'n/a'} / ${(race.firstMeta || '').trim().slice(0, 22)}`);
+  check('各页画布比例一致（页尺寸没被别页覆盖）',
+    race.ks && race.ks.length >= 3 && race.spread < 0.01,
+    `k 极差 ${race.spread != null ? race.spread.toFixed(4) : 'n/a'}`);
+  await shot('cross-device');
 
   console.log(`\n合计 ${pass} 项通过，${fail} 项失败`);
   if (errors.length) {
