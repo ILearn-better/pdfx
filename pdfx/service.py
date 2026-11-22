@@ -21,12 +21,15 @@ import os
 import re
 import tempfile
 import threading
+import time
 import traceback
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 from flask import Flask, Blueprint, jsonify, request, send_file, send_from_directory
 
+from . import split as split_mod
 from .doc import PDFDocument
 from .util import PdfxError, fail, ok, __version__ as PDFX_VERSION
 
@@ -117,6 +120,90 @@ class Session:
 SESSION = Session()
 
 
+class SplitJobs:
+    """批量分割的后台任务表。
+
+    400 页扫描件拆 8 份要几十秒，同步 HTTP 撑不住：浏览器会先超时，
+    用户也看不到进度。所以起线程跑、前端轮询。取消只在"每份之间"生效 ——
+    半份 PDF 写到一半停掉没有意义，临时文件会一起删掉。
+    """
+
+    def __init__(self, keep: int = 6) -> None:
+        self.jobs: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        self._seq = 0
+        self.keep = max(1, int(keep))
+        self.lock = threading.Lock()
+
+    def start(self, work) -> str:
+        with self.lock:
+            self._seq += 1
+            jid = f"s{self._seq}"
+            job: dict[str, Any] = {
+                "id": jid,
+                "state": "running",
+                "total": 0,
+                "done": 0,
+                "written": 0,
+                "current": "",
+                "files": [],
+                "out_dir": "",
+                "warnings": [],
+                "error": None,
+                "started": time.time(),
+                "elapsed": 0.0,
+                "bytes": 0,
+                "cancel": threading.Event(),
+            }
+            self.jobs[jid] = job
+            # 只留最近几份已结束的，长跑进程不会越攒越多
+            finished = [k for k, j in self.jobs.items() if j["state"] != "running"]
+            for k in finished[: max(0, len(finished) - self.keep)]:
+                self.jobs.pop(k, None)
+
+        def runner() -> None:
+            t0 = time.time()
+            try:
+                res = work(job) or {}
+                job["files"] = res.get("files") or job["files"]
+                job["out_dir"] = res.get("out_dir") or job["out_dir"]
+                job["warnings"] = res.get("warnings") or job["warnings"]
+                job["total"] = res.get("part_count") or job["total"]
+                job["done"] = res.get("written") or job["done"]
+                job["written"] = res.get("written") or 0
+                job["bytes"] = res.get("total_bytes") or 0
+                job["state"] = "cancelled" if res.get("cancelled") else "done"
+            except PdfxError as exc:
+                job["state"] = "error"
+                job["error"] = exc.to_dict()
+            except Exception as exc:  # pragma: no cover
+                traceback.print_exc()
+                job["state"] = "error"
+                job["error"] = {"code": "internal", "message": f"{type(exc).__name__}: {exc}"}
+            finally:
+                job["elapsed"] = round(time.time() - t0, 2)
+                job["current"] = ""
+                job["finished"] = time.time()
+
+        threading.Thread(target=runner, name=f"pdfx-split-{jid}", daemon=True).start()
+        return jid
+
+    def get(self, jid: str) -> dict[str, Any]:
+        job = self.jobs.get(jid)
+        if not job:
+            raise PdfxError(f"任务不存在或已过期: {jid}", "no_job")
+        return {k: v for k, v in job.items() if k != "cancel"}
+
+    def cancel(self, jid: str) -> dict[str, Any]:
+        job = self.jobs.get(jid)
+        if not job:
+            raise PdfxError(f"任务不存在或已过期: {jid}", "no_job")
+        job["cancel"].set()
+        return {"id": jid, "state": job["state"], "cancel_requested": True}
+
+
+SPLIT_JOBS = SplitJobs()
+
+
 def _body() -> dict[str, Any]:
     if request.is_json:
         return request.get_json(silent=True) or {}
@@ -146,6 +233,69 @@ def _wrap(fn):
 
     inner.__name__ = fn.__name__
     return inner
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _split_source(b: dict[str, Any]) -> tuple[Any, int, str, list[dict[str, Any]]]:
+    """分割要用的源 → (源, 页数, 用于命名/默认目录的路径, 目录条目)。
+
+    - 指定了 path：直接开文件，完全不碰会话里的文档
+    - 否则用当前文档：没改过就直接拿磁盘文件（快）；改过就把内存文档序列化成
+      bytes，保证导出的是屏幕上看到的样子（含未保存的修改）
+    """
+    path = str(b.get("path") or "").strip()
+    if path:
+        p = Path(path).expanduser()
+        if not p.exists():
+            raise PdfxError(f"文件不存在: {p}", "not_found")
+        doc, own = split_mod.open_source(str(p), b.get("password") or None)
+        try:
+            if doc.page_count <= 0:
+                raise PdfxError("这份 PDF 没有页面", "empty_document")
+            return str(p), doc.page_count, str(p), split_mod.list_toc(doc)
+        finally:
+            if own:
+                doc.close()
+
+    d = SESSION.get(b.get("doc"))
+    with d.lock:
+        count = d.page_count
+        if count <= 0:
+            raise PdfxError("这份文档没有页面", "empty_document")
+        toc = split_mod.list_toc(d.doc)
+        src_path = str(d.path) if d.path else ""
+        if not d._dirty and src_path and Path(src_path).exists():
+            return src_path, count, src_path, toc
+        try:
+            raw = d.doc.tobytes(garbage=0, deflate=False)
+        except Exception as exc:
+            raise PdfxError(f"读不到当前文档内容（{exc}），请先「保存」再分割", "snapshot_failed")
+        return raw, count, src_path, toc
+
+
+def _split_plan(b: dict[str, Any], count: int, src_path: str,
+                toc: list[dict[str, Any]]) -> dict[str, Any]:
+    pl = split_mod.plan(
+        count,
+        mode=str(b.get("mode") or "ranges"),
+        ranges=b.get("ranges") or "",
+        every=_as_int(b.get("every"), 0),
+        level=_as_int(b.get("level"), 1),
+        toc=toc,
+        prefix=str(b.get("prefix") or ""),
+        out_dir=str(b.get("out_dir") or "").strip(),
+        source=src_path,
+        home=Path.home(),
+    )
+    pl["source"] = src_path or "(未保存的文档)"
+    pl["source_name"] = Path(src_path).name if src_path else "(未保存的文档)"
+    return pl
 
 
 def create_app(initial: str | None = None) -> Flask:
@@ -217,6 +367,15 @@ def create_app(initial: str | None = None) -> Flask:
         safe = re.sub(r"[^\w.\-\u4e00-\u9fff]+", "_", f.filename or "upload.pdf")
         target = UPLOAD_DIR / safe
         f.save(str(target))
+        # no_open=1：只要一个落盘路径（批量分割挑源文件用），
+        # 别把它打开成一篇新文档 —— 那会把用户正在编辑的文档顶掉
+        if request.args.get("no_open") in ("1", "true", "yes"):
+            with target.open("rb") as fh:
+                head = fh.read(4)
+            if head != b"%PDF":
+                target.unlink(missing_ok=True)
+                raise PdfxError("这不是一份 PDF 文件", "bad_pdf")
+            return {"path": str(target), "name": target.name, "size": target.stat().st_size}
         doc = PDFDocument(target)
         did = SESSION.add(doc)
         return {"doc_id": did, "path": str(target), **doc.info()}
@@ -237,6 +396,7 @@ def create_app(initial: str | None = None) -> Flask:
                 "text.transform", "image.transform",
                 "ink.local_erase", "canvas.layered", "erase.content", "erase.guarded",
                 "ocr.optional", "bitmap.cached", "image.clipboard",
+                "split.batch", "split.job",
             ],
         }
 
@@ -585,6 +745,60 @@ def create_app(initial: str | None = None) -> Flask:
         doc = SESSION.get(_body().get("doc"))
         page = _body().get("page")
         return doc.clear_strokes(int(page) if page is not None else None)
+
+    # ------------------------------------------------------------------ 批量分割
+    @app.post("/api/split/plan")
+    @_wrap
+    def api_split_plan():
+        """只算不写：前端拿它做实时预览（文件名、页数、重名、重叠、遗漏）。"""
+        b = _body()
+        _source, count, src_path, toc = _split_source(b)
+        return _split_plan(b, count, src_path, toc)
+
+    @app.post("/api/split")
+    @_wrap
+    def api_split():
+        b = _body()
+        source, count, src_path, toc = _split_source(b)
+        pl = _split_plan(b, count, src_path, toc)
+        if not pl["parts"]:
+            raise PdfxError("没有可导出的分段", "empty_plan")
+        overwrite = bool(b.get("overwrite"))
+        # 已存在就整批拒绝：写一半再报错，用户分不清哪几份是新的
+        if pl["conflicts"] and not overwrite:
+            raise PdfxError(
+                f"有 {len(pl['conflicts'])} 个目标文件已存在"
+                f"（如 {Path(pl['conflicts'][0]).name}），确认覆盖请勾选「覆盖同名文件」",
+                "exists",
+                files=pl["conflicts"],
+            )
+
+        def work(job: dict[str, Any]) -> dict[str, Any]:
+            job["out_dir"] = pl["out_dir"]
+            job["total"] = pl["part_count"]
+
+            def on_progress(done: int, total: int, entry: dict[str, Any]) -> None:
+                job["done"] = done
+                job["total"] = total
+                job["current"] = entry.get("file") or ""
+                job["files"] = job["files"] + [entry]
+
+            return split_mod.run(
+                source, pl, overwrite=overwrite, progress=on_progress, cancel=job["cancel"]
+            )
+
+        jid = SPLIT_JOBS.start(work)
+        return {"job_id": jid, "plan": pl}
+
+    @app.get("/api/split/job")
+    @_wrap
+    def api_split_job():
+        return SPLIT_JOBS.get(str(request.args.get("id") or ""))
+
+    @app.post("/api/split/cancel")
+    @_wrap
+    def api_split_cancel():
+        return SPLIT_JOBS.cancel(str(_body().get("id") or ""))
 
     # ------------------------------------------------------------------ 检索
     @app.post("/api/search")

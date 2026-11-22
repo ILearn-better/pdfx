@@ -308,6 +308,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--radius", type=float, default=10)
     sp.add_argument("--no-text", action="store_true", help="只涂图像内容，不删文字层")
 
+    # ---- 批量分割
+    sp = sub.add_parser("split", help="按页码 / 每 N 页 / 目录，把一份 PDF 拆成多个文件")
+    add_common(sp)
+    sp.add_argument("--ranges", "-r", help='页码范围（1 基、含首尾）："1-10, 11-30"；"1-10:封面" 可单独起名')
+    sp.add_argument("--every", type=int, help="每 N 页一份（与 --ranges 二选一）")
+    sp.add_argument("--toc", action="store_true", help="按目录/书签切（默认取 1 级条目）")
+    sp.add_argument("--level", type=int, default=1, help="目录层级，配合 --toc（默认 1）")
+    sp.add_argument("--out-dir", "-d", help="输出目录（默认：源文件旁 <书名>_split/）")
+    sp.add_argument("--prefix", help="文件名前缀（默认取源文件名）")
+    sp.add_argument("--overwrite", action="store_true", help="覆盖同名文件")
+    sp.add_argument("--dry-run", action="store_true", help="只列出会导出哪些文件，不写盘")
+
     # ---- 检索
     sp = sub.add_parser("search", help="全文检索（自动对扫描页 OCR）")
     add_common(sp)
@@ -371,7 +383,8 @@ def dispatch(args: argparse.Namespace) -> Any:
             print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
             raise SystemExit(4)
         caps = (payload.get("data") or {}).get("caps") or []
-        fresh = "erase.content" in caps and "ocr.optional" in caps and "erase.guarded" in caps
+        fresh = ("erase.content" in caps and "ocr.optional" in caps
+                 and "erase.guarded" in caps and "split.batch" in caps)
         print(json.dumps({"ok": True, "version": (payload.get("data") or {}).get("version"),
                           "caps": caps, "fresh": fresh}, ensure_ascii=False))
         raise SystemExit(0 if fresh else 3)
@@ -524,6 +537,22 @@ def dispatch(args: argparse.Namespace) -> Any:
             erase_text=not getattr(args, "no_text", False),
         )
         return r.finish(res, mutate=True)
+
+    if cmd == "split":
+        doc = r.open()
+        mode = "toc" if args.toc else ("every" if args.every else "ranges")
+        pl = doc.split_plan(
+            mode=mode,
+            ranges=args.ranges or "",
+            every=args.every or 0,
+            level=args.level,
+            out_dir=args.out_dir,
+            prefix=args.prefix or "",
+        )
+        if args.dry_run:
+            return pl
+        res = doc.split_export(pl, overwrite=bool(args.overwrite))
+        return {**res, "source": str(doc.path) if doc.path else None, "mode": mode}
 
     if cmd == "search":
         doc = r.open()

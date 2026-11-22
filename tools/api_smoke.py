@@ -75,6 +75,17 @@ def call(path: str, payload=None, method: str | None = None, raw: bool = False):
     return json.loads(body.decode("utf-8"))
 
 
+def call_err(path: str, payload=None) -> dict:
+    """调用并接住 4xx：错误分支本身就是要断言的东西。"""
+    try:
+        return call(path, payload)
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            return {"ok": False, "error": {"code": f"http_{exc.code}", "message": str(exc)}}
+
+
 def check(name: str, cond: bool, extra: str = "") -> bool:
     print(f"{'PASS' if cond else 'FAIL'}  {name}{(' — ' + extra) if extra else ''}")
     return cond
@@ -85,6 +96,23 @@ def _head(path: str):
     req = urllib.request.Request(BASE + path)
     with _opener.open(req, timeout=60) as resp:
         return resp.read(), dict(resp.headers)
+
+
+def _upload(path: Path, name: str) -> dict:
+    """multipart 上传；no_open=1 只落盘不开文档。"""
+    boundary = "----pdfx" + os.urandom(8).hex()
+    body = (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
+        "Content-Type: application/pdf\r\n\r\n"
+    ).encode() + path.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        BASE + "/api/upload?no_open=1",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with _opener.open(req, timeout=90) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
 def main() -> int:
@@ -221,8 +249,53 @@ def main() -> int:
     saved = call("/api/save", {"path": None})["data"]
     ok_all &= check("POST /api/save", saved["size"] > 1000, f"{saved['size']} bytes")
 
+    # ---- 批量分割：先预览、再后台跑、最后看落盘 ----
+    split_dir = work / "split"
+    import shutil as _shutil
+
+    _shutil.rmtree(split_dir, ignore_errors=True)  # 重复跑时上一次的产物会被当成"同名冲突"
+    spl = call("/api/split/plan", {"mode": "ranges", "ranges": "1-1, 2-2", "out_dir": str(split_dir)})["data"]
+    ok_all &= check(
+        "POST /api/split/plan 预览（不写盘）",
+        spl["part_count"] == 2 and spl["parts"][0]["from"] == 1 and not split_dir.exists(),
+        f"{spl['part_count']} 份 · {[p['file'] for p in spl['parts']]}",
+    )
+    bad = call_err("/api/split/plan", {"mode": "ranges", "ranges": "9-10"})
+    ok_all &= check("超出总页数的分段被拒绝",
+                    bad.get("ok") is False and bad["error"]["code"] == "page_out_of_range",
+                    bad.get("error", {}).get("message", ""))
+
+    start = call("/api/split", {"mode": "ranges", "ranges": "1-1, 2-2", "out_dir": str(split_dir)})["data"]
+    jid = start.get("job_id")
+    job = {}
+    for _ in range(200):
+        job = call(f"/api/split/job?id={jid}")["data"]
+        if job["state"] != "running":
+            break
+        time.sleep(0.1)
+    ok_all &= check("POST /api/split 后台任务跑完", job.get("state") == "done" and job.get("written") == 2,
+                    f"{job.get('state')} {job.get('done')}/{job.get('total')}")
+    ok_all &= check("导出的文件都落盘了（页数对得上）",
+                    len(job.get("files") or []) == 2
+                    and all(Path(f["path"]).exists() and f["bytes"] > 500 for f in job["files"]),
+                    str([f"{f['file']}:{f['pages']}p" for f in job.get("files") or []]))
+
+    again = call_err("/api/split", {"mode": "ranges", "ranges": "1-1, 2-2", "out_dir": str(split_dir)})
+    ok_all &= check("同名文件默认报 exists", again.get("ok") is False and again["error"]["code"] == "exists",
+                    again.get("error", {}).get("message", ""))
+
+    # 上传只落盘、不开成新文档：界面「选择其他文件」走这条
+    docs_before = len(call("/api/docs")["data"]["docs"])
+    up = _upload(ROOT / "samples" / "sample_scan.pdf", "picked.pdf")
+    docs_after = len(call("/api/docs")["data"]["docs"])
+    ok_all &= check("POST /api/upload?no_open=1 只给路径（不新增文档）",
+                    up.get("ok") and Path(up["data"]["path"]).exists() and docs_after == docs_before,
+                    f"{Path(up.get('data', {}).get('path', '')).name} · 文档数 {docs_before}→{docs_after}")
+
     caps = call("/api/caps")["data"]
     ok_all &= check("GET /api/caps", "text.transform" in caps.get("caps", []), f"{len(caps.get('caps', []))} 项能力")
+    ok_all &= check("能力清单里声明了批量分割", "split.batch" in caps.get("caps", []),
+                    str([c for c in caps.get("caps", []) if c.startswith("split")]))
 
     und = call("/api/undo", {})["data"]
     ok_all &= check("POST /api/undo", und.get("undone") is True)

@@ -69,6 +69,42 @@ def _rect_list(r) -> list[float]:
     return [round(float(r.x0), 2), round(float(r.y0), 2), round(float(r.x1), 2), round(float(r.y1), 2)]
 
 
+# ---------------------------------------------------------------- 状态读写（模块级）
+# 抽成模块函数是为了让 split.py 能把状态搬到拆出来的新文档上：
+# insert_pdf 会给页重新分配 xref，而状态是按 xref 存的，必须重映射。
+
+def read_state(doc: fitz.Document) -> dict[str, Any]:
+    try:
+        kind, val = doc.xref_get_key(doc.pdf_catalog(), STATE_KEY)
+        if kind == "xref" and val:
+            xref = int(val.split()[0])
+            raw = doc.xref_stream(xref)
+            if raw:
+                data = json.loads(raw.decode("utf-8"))
+                if isinstance(data, dict) and "pages" in data:
+                    return data
+    except Exception:
+        pass
+    return {"version": 1, "pages": {}}
+
+
+def write_state(doc: fitz.Document, state: dict[str, Any]) -> None:
+    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    try:
+        cat = doc.pdf_catalog()
+        kind, val = doc.xref_get_key(cat, STATE_KEY)
+        if kind == "xref" and val:
+            xref = int(val.split()[0])
+            doc.update_stream(xref, payload)
+        else:
+            xref = doc.get_new_xref()
+            doc.update_object(xref, "<<>>")
+            doc.update_stream(xref, payload)
+            doc.xref_set_key(cat, STATE_KEY, f"{xref} 0 R")
+    except Exception as exc:
+        raise PdfxError(f"写入文档状态失败: {exc}", "state_write_failed")
+
+
 class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
     # ================================================================== 生命周期
     def __init__(
@@ -161,34 +197,10 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
 
     # ------------------------------------------------------------------ 状态
     def _load_state(self) -> None:
-        self.state = {"version": 1, "pages": {}}
-        try:
-            kind, val = self.doc.xref_get_key(self.doc.pdf_catalog(), STATE_KEY)
-            if kind == "xref" and val:
-                xref = int(val.split()[0])
-                raw = self.doc.xref_stream(xref)
-                if raw:
-                    data = json.loads(raw.decode("utf-8"))
-                    if isinstance(data, dict) and "pages" in data:
-                        self.state = data
-        except Exception:
-            pass
+        self.state = read_state(self.doc)
 
     def _persist_state(self) -> None:
-        payload = json.dumps(self.state, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        try:
-            cat = self.doc.pdf_catalog()
-            kind, val = self.doc.xref_get_key(cat, STATE_KEY)
-            if kind == "xref" and val:
-                xref = int(val.split()[0])
-                self.doc.update_stream(xref, payload)
-            else:
-                xref = self.doc.get_new_xref()
-                self.doc.update_object(xref, "<<>>")
-                self.doc.update_stream(xref, payload)
-                self.doc.xref_set_key(cat, STATE_KEY, f"{xref} 0 R")
-        except Exception as exc:
-            raise PdfxError(f"写入文档状态失败: {exc}", "state_write_failed")
+        write_state(self.doc, self.state)
 
     def export_state(self) -> dict[str, Any]:
         return copy.deepcopy(self.state)
@@ -456,6 +468,60 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
             other.close()
         self._touch()
         return list(range(at, at + len(idxs)))
+
+    # ================================================================== 批量分割
+    def toc_entries(self) -> list[dict[str, Any]]:
+        """目录/书签条目 ``[{level, title, page}]``（page 1 基，外部链接已丢）。"""
+        from .split import list_toc
+
+        return list_toc(self.doc)
+
+    def split_plan(
+        self,
+        *,
+        mode: str = "ranges",
+        ranges: Any = "",
+        every: int = 0,
+        level: int = 1,
+        out_dir: str | os.PathLike | None = None,
+        prefix: str = "",
+    ) -> dict[str, Any]:
+        """算一遍「按当前设置会切出哪些文件」，不写盘（界面用它做实时预览）。"""
+        from . import split as split_mod
+
+        src = str(self.path) if self.path else ""
+        return split_mod.plan(
+            self.doc.page_count,
+            mode=mode,
+            ranges=ranges,
+            every=every,
+            level=level,
+            toc=split_mod.list_toc(self.doc) if mode == "toc" else None,
+            prefix=prefix,
+            out_dir=out_dir or "",
+            source=src,
+            home=Path.home(),
+        )
+
+    def split_export(
+        self,
+        plan_obj: dict[str, Any],
+        *,
+        overwrite: bool = False,
+        progress: Callable[[int, int, dict[str, Any]], None] | None = None,
+        cancel: Any = None,
+    ) -> dict[str, Any]:
+        """按 ``split_plan()`` 的结果导出。用内存里的文档切，未保存的修改也带上。"""
+        from . import split as split_mod
+
+        return split_mod.run(
+            self.doc,
+            plan_obj,
+            state=self.state,
+            overwrite=overwrite,
+            progress=progress,
+            cancel=cancel,
+        )
 
     # ================================================================== 保存
     def save(self, path: str | os.PathLike | None = None, incremental: bool = False,

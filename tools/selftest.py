@@ -352,6 +352,116 @@ def main() -> int:
     ok("笔迹撤销后位图回到原样", d.render(0, 96) == a)
     d.close()
 
+    section("批量分割")
+    # 这一段会真的写文件；重复跑之前先清干净，否则"同名文件已存在"会让后面的断言失败
+    for sub in ("split_a", "split_b", "split_c", "split_d", "split_e", "split_x"):
+        shutil.rmtree(TMP / sub, ignore_errors=True)
+    book = TMP / "book12.pdf"
+    bd = fitz.open()
+    for i in range(12):
+        pg = bd.new_page(width=595, height=842)
+        pg.insert_text((72, 100), f"Page {i + 1}", fontsize=20)
+    bd.set_toc([[1, "第一章", 1], [2, "1.1 小节", 2], [1, "第二章", 5], [1, "第三章", 9]])
+    bd.save(str(book))
+    bd.close()
+
+    d = PDFDocument(book)
+    ok("样例书 12 页", d.page_count == 12)
+    pl = d.split_plan(mode="ranges", ranges="1-5, 6-9, 10-12", out_dir=TMP / "split_a")
+    ok("三段页码 → 3 份，页数 5/4/3", [p["pages"] for p in pl["parts"]] == [5, 4, 3],
+       str([p["pages"] for p in pl["parts"]]))
+    ok("默认文件名带页码区间", [p["file"] for p in pl["parts"]]
+       == ["book12_1-5.pdf", "book12_6-9.pdf", "book12_10-12.pdf"],
+       str([p["file"] for p in pl["parts"]]))
+    ok("首尾相接时没有重叠、没有遗漏", not pl["duplicated"] and not pl["uncovered"])
+
+    res = d.split_export(pl)
+    ok("写出 3 个文件且都在磁盘上",
+       res["written"] == 3 and all((TMP / "split_a" / f["file"]).exists() for f in res["files"]))
+    sizes = [fitz.open(f["path"]).page_count for f in res["files"]]
+    ok("每份页数与计划一致", sizes == [5, 4, 3], str(sizes))
+    ok("第 2 份第 1 页就是原文档第 6 页",
+       fitz.open(res["files"][1]["path"])[0].get_text("text").strip().startswith("Page 6"))
+    toc2 = fitz.open(res["files"][1]["path"]).get_toc(simple=True)
+    ok("目录被裁到段内（页号平移后仍指向正确页）",
+       bool(toc2) and all(1 <= e[2] <= 4 for e in toc2), str(toc2))
+
+    # 未保存的修改也要跟着走：用户加了批注、画了笔迹，导出后还应是"可再编辑"的对象
+    d.add_text(5, "导出前的批注", point=[300, 300], font_size=13, color="#c00")
+    d.add_strokes(5, [{"points": [[100, 700], [200, 720]], "color": "#1a73e8", "width": 3}])
+    r2 = d.split_export(d.split_plan(mode="ranges", ranges="6-8", out_dir=TMP / "split_b"))
+    part = PDFDocument(r2["files"][0]["path"])
+    users = [t["text"] for t in part.list_text(0)["items"] if t.get("source") == "user"]
+    ok("未保存的批注进了导出文件", any("导出前的批注" in u for u in users), str(users))
+    ok("批注仍是可整体拖动的文本框（不是散装文字）", any(t.get("id", "").startswith("p0:ut")
+       for t in part.list_text(0)["items"] if t.get("source") == "user"))
+    ok("笔迹跟着页面走", part.list_strokes(0)["count"] == 1)
+    part.close()
+
+    pl3 = d.split_plan(mode="every", every=5, out_dir=TMP / "split_c")
+    ok("每 5 页一份 → 5/5/2", [p["pages"] for p in pl3["parts"]] == [5, 5, 2],
+       str([p["pages"] for p in pl3["parts"]]))
+    pl4 = d.split_plan(mode="toc", level=1, out_dir=TMP / "split_d")
+    ok("按 1 级目录切出 3 章",
+       pl4["part_count"] == 3 and [p["title"] for p in pl4["parts"]] == ["第一章", "第二章", "第三章"],
+       str([p["title"] for p in pl4["parts"]]))
+    ok("按目录切时文件名带章节名", "第一章" in pl4["parts"][0]["file"], pl4["parts"][0]["file"])
+    r4 = d.split_export(pl4)
+    ok("第二章那份正好是第 5-8 页",
+       (r4["files"][1]["from"], r4["files"][1]["to"]) == (5, 8),
+       f"{r4['files'][1]['from']}-{r4['files'][1]['to']}")
+
+    ok("单页写法和 1- 开区间都能解析",
+       [(p["from"], p["to"]) for p in d.split_plan(mode="ranges", ranges="3, 7-",
+                                                   out_dir=TMP / "split_x")["parts"]]
+       == [(3, 3), (7, 12)])
+    ok("1-10:封面 用自定义文件名",
+       d.split_plan(mode="ranges", ranges="1-2:封面, 3-12", out_dir=TMP / "split_x")["parts"][0]["file"]
+       == "封面.pdf")
+
+    for bad, code in (("10-2", "bad_range"), ("0-3", "bad_range"), ("30-40", "page_out_of_range"),
+                      ("", "empty_ranges"), ("abc", "bad_range")):
+        try:
+            d.split_plan(mode="ranges", ranges=bad, out_dir=TMP / "split_x")
+            ok(f"非法范围 {bad!r} 应报错", False)
+        except PdfxError as exc:
+            ok(f"非法范围 {bad!r} 报 {code}", exc.code == code, exc.code)
+
+    plo = d.split_plan(mode="ranges", ranges="1-10, 2-12", out_dir=TMP / "split_x")
+    ok("重叠的页会被点名", plo["duplicated"] == [[2, 10]], str(plo["duplicated"]))
+    plg = d.split_plan(mode="ranges", ranges="1-5, 9-12", out_dir=TMP / "split_x")
+    ok("漏掉的页会被点名", plg["uncovered"] == [[6, 8]], str(plg["uncovered"]))
+    ok("超出末页的段被截断并提示",
+       d.split_plan(mode="ranges", ranges="1-40", out_dir=TMP / "split_x")["parts"][0]["to"] == 12
+       and any("截断" in w for w in d.split_plan(mode="ranges", ranges="1-40",
+                                                 out_dir=TMP / "split_x")["warnings"]))
+
+    try:
+        d.split_export(d.split_plan(mode="ranges", ranges="1-5", out_dir=TMP / "split_a"))
+        ok("同名文件默认不覆盖", False)
+    except PdfxError as exc:
+        ok("同名文件默认报 exists", exc.code == "exists")
+    ok("显式 overwrite 才覆盖",
+       d.split_export(d.split_plan(mode="ranges", ranges="1-5", out_dir=TMP / "split_a"),
+                      overwrite=True)["written"] == 1)
+
+    import threading
+
+    stop = threading.Event()
+    stop.set()
+    rc = d.split_export(d.split_plan(mode="ranges", ranges="1-3", out_dir=TMP / "split_e"), cancel=stop)
+    ok("取消后一份都不写（不留半截文件）",
+       rc["cancelled"] and rc["written"] == 0 and not list((TMP / "split_e").glob("*.pdf")))
+
+    plain = fresh("samples/sample_text.pdf", "notoc.pdf")
+    try:
+        plain.split_plan(mode="toc", out_dir=TMP / "split_x")
+        ok("没有目录时按目录切应报错", False)
+    except PdfxError as exc:
+        ok("没有目录时报 no_toc", exc.code == "no_toc")
+    plain.close()
+    d.close()
+
     section("异常处理")
     try:
         PDFDocument(TMP / "nope.pdf")

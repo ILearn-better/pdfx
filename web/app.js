@@ -142,26 +142,48 @@
   }
 
   /* ------------------------------------------------------------------ 弹窗 */
-  function dialog({ title, html, okText = '确定', cancelText = '取消', onMount }) {
+  function dialog({ title, html, okText = '确定', cancelText = '取消', wide = false, onMount, onOk }) {
     return new Promise((resolve) => {
       const back = $('#modal');
+      back.querySelector('.modal').classList.toggle('wide', !!wide);
       $('#modal-title').textContent = title;
       $('#modal-body').innerHTML = html;
       const foot = $('#modal-foot');
       foot.innerHTML = '';
+      foot.hidden = false;
+      let cancelBtn = null;
       if (cancelText) {
         const b = document.createElement('button');
         b.className = 'btn';
         b.textContent = cancelText;
         b.onclick = () => close(null);
         foot.appendChild(b);
+        cancelBtn = b;
       }
+      let okBtn = null;
       if (okText) {
         const b = document.createElement('button');
         b.className = 'btn primary';
         b.textContent = okText;
-        b.onclick = () => close(collect());
+        // onOk 返回 false = "先别关"：分割这种要跑后台任务、结果还要留在弹窗里的
+        // 流程，不能点一下就把窗关了
+        b.onclick = async () => {
+          if (!onOk) return close(collect());
+          b.disabled = true;
+          try {
+            const v = await onOk(collect(), b);
+            if (v === false) {
+              b.disabled = false;
+              return;
+            }
+            close(v);
+          } catch (e) {
+            b.disabled = false;
+            toast(e.message || '操作失败', 'err');
+          }
+        };
         foot.appendChild(b);
+        okBtn = b;
       }
       const collect = () => {
         const out = {};
@@ -185,7 +207,9 @@
       const body = $('#modal-body');
       const first = body.querySelector('input, textarea');
       if (first) setTimeout(() => first.focus(), 30);
-      if (onMount) onMount(body, close, collect);
+      if (onMount) {
+        onMount(body, close, collect, { ok: okBtn, cancel: cancelBtn });
+      }
     });
   }
 
@@ -2083,6 +2107,474 @@
     } catch (e) { toast(e.message, 'err'); }
   };
 
+  /* ------------------------------------------------------------------ 批量分割 */
+  /* 400 页的教材按 1-10 / 11-30 / 31-40 拆成 3 份 —— 边填边看会切出哪些文件，
+   * 确认后后台跑，跑完在弹窗里直接看结果。
+   * 两个约定：
+   *  1) 页码范围是 **1 基闭区间**（1-10 = 第 1~10 页）。库内其它接口都是 0 基，
+   *     但"用户手写的页码范围"不可能是 0 基，换算统一放在后端做一次。
+   *  2) 400 页拆 8 份要几十秒，同步请求会先超时，所以走后台任务 + 轮询。 */
+  function openSplitDialog() {
+    if (!S.doc) return toast('先打开或新建一个文档', 'err');
+    const st = {
+      mode: 'ranges',
+      srcPath: '',
+      timer: 0,
+      plan: null,
+      running: false,
+      job: '',
+      outTouched: false,
+      preTouched: false,
+    };
+    const firstRanges = `1-${Math.min(10, Math.max(1, S.pageCount))}`;
+    const every0 = Math.max(1, Math.min(50, Math.ceil((S.pageCount || 1) / 4)));
+
+    const html = `
+      <div class="split" id="sp-form">
+        <div class="sp-src">
+          <div class="sp-src-main">
+            <div class="sp-src-name" id="sp-src-name">${esc(baseName(S.path) || '（未保存的文档）')}</div>
+            <div class="sp-src-meta" id="sp-src-meta">当前文档 · ${S.pageCount} 页${S.path ? '' : ' · 尚未保存'}</div>
+          </div>
+          <button class="btn small" id="sp-pick">选择其他文件…</button>
+        </div>
+
+        <div class="sp-modes" id="sp-modes">
+          <button class="sp-mode active" data-mode="ranges">页码范围</button>
+          <button class="sp-mode" data-mode="every">每 N 页</button>
+          <button class="sp-mode" data-mode="toc">按目录书签</button>
+        </div>
+
+        <div class="sp-pane" data-pane="ranges">
+          <textarea id="sp-ranges" spellcheck="false">${esc(firstRanges)}</textarea>
+          <div class="hint">每行一段，也能用逗号隔开。页码从 <b>1</b> 开始、含首尾；
+            <code>1-</code> 表示到最后一页；<code>1-10:封面</code> 可单独给这一段起文件名。</div>
+        </div>
+
+        <div class="sp-pane" data-pane="every" hidden>
+          <div class="field row">
+            <div><label>每份页数</label><input type="number" id="sp-every" min="1" step="1" value="${every0}" /></div>
+            <div><label>预计</label><div class="sp-calc" id="sp-every-calc">—</div></div>
+          </div>
+        </div>
+
+        <div class="sp-pane" data-pane="toc" hidden>
+          <div class="field row">
+            <div><label>目录层级</label>
+              <select id="sp-level">
+                <option value="1">1 级（章）</option>
+                <option value="2">2 级（节）</option>
+                <option value="3">3 级</option>
+              </select></div>
+            <div><label>预计</label><div class="sp-calc" id="sp-toc-calc">—</div></div>
+          </div>
+          <div class="hint">按书签切，文件名会带上章节标题。没有目录的 PDF 会直接提示换一种方式。</div>
+        </div>
+
+        <div class="sp-out">
+          <div class="field"><label>输出目录</label>
+            <div class="sp-row">
+              <input type="text" id="sp-outdir" placeholder="默认：源文件旁 <书名>_split/" />
+              <button class="btn small" id="sp-browse-dir">换目录</button>
+            </div>
+          </div>
+          <div class="field"><label>文件名前缀</label>
+            <input type="text" id="sp-prefix" placeholder="默认取源文件名" />
+          </div>
+          <label class="chk"><input type="checkbox" id="sp-overwrite" /> 覆盖同名文件</label>
+        </div>
+
+        <div class="sp-summary" id="sp-summary">正在计算…</div>
+        <div class="sp-rows-wrap">
+          <table class="sp-table">
+            <thead><tr><th>#</th><th>页码</th><th>页数</th><th>文件名</th></tr></thead>
+            <tbody id="sp-rows"></tbody>
+          </table>
+        </div>
+        <div class="sp-warns" id="sp-warns"></div>
+      </div>
+
+      <div class="sp-progress" id="sp-progress" hidden>
+        <div class="sp-bar"><i id="sp-bar-fill"></i></div>
+        <div class="sp-prog-text" id="sp-prog-text">准备中…</div>
+        <div class="actions" style="margin-top:12px">
+          <button class="btn" id="sp-cancel">取消这次分割</button>
+        </div>
+      </div>
+
+      <div class="sp-done" id="sp-done" hidden></div>`;
+
+    dialog({
+      title: '批量分割 PDF',
+      wide: true,
+      okText: '开始分割',
+      cancelText: '取消',
+      html,
+      onMount: (body, close, _collect, btns) => {
+        const formEl = body.querySelector('#sp-form');
+        const progEl = body.querySelector('#sp-progress');
+        const doneEl = body.querySelector('#sp-done');
+        const rowsEl = body.querySelector('#sp-rows');
+        const sumEl = body.querySelector('#sp-summary');
+        const warnEl = body.querySelector('#sp-warns');
+        const rangesEl = body.querySelector('#sp-ranges');
+        const everyEl = body.querySelector('#sp-every');
+        const levelEl = body.querySelector('#sp-level');
+        const outEl = body.querySelector('#sp-outdir');
+        const preEl = body.querySelector('#sp-prefix');
+        const overEl = body.querySelector('#sp-overwrite');
+        const barEl = body.querySelector('#sp-bar-fill');
+        const progText = body.querySelector('#sp-prog-text');
+        const srcNameEl = body.querySelector('#sp-src-name');
+        const srcMetaEl = body.querySelector('#sp-src-meta');
+
+        const payload = () => {
+          const p = {
+            mode: st.mode,
+            ranges: st.mode === 'ranges' ? rangesEl.value : '',
+            every: st.mode === 'every' ? parseInt(everyEl.value, 10) || 0 : 0,
+            level: st.mode === 'toc' ? parseInt(levelEl.value, 10) || 1 : 1,
+            out_dir: outEl.value.trim(),
+            prefix: preEl.value.trim(),
+            overwrite: overEl.checked,
+          };
+          if (st.srcPath) p.path = st.srcPath;
+          else p.doc = S.doc;
+          return p;
+        };
+
+        function setMode(mode) {
+          st.mode = mode;
+          body.querySelectorAll('.sp-mode').forEach((b) =>
+            b.classList.toggle('active', b.dataset.mode === mode)
+          );
+          body.querySelectorAll('.sp-pane').forEach((p) =>
+            (p.hidden = p.dataset.pane !== mode)
+          );
+          preview();
+        }
+        body.querySelectorAll('.sp-mode').forEach((b) => {
+          b.onclick = () => setMode(b.dataset.mode);
+        });
+
+        function renderError(msg) {
+          st.plan = null;
+          rowsEl.innerHTML = `<tr><td colspan="4" class="sp-bad">${esc(msg)}</td></tr>`;
+          sumEl.textContent = '还差一步';
+          warnEl.innerHTML = '';
+          if (btns.ok) btns.ok.disabled = true;
+          body.querySelector('#sp-every-calc').textContent = '—';
+          body.querySelector('#sp-toc-calc').textContent = '—';
+        }
+
+        function renderPlan(pl) {
+          st.plan = pl;
+          if (!st.outTouched && pl.out_dir) outEl.value = pl.out_dir;
+          if (!st.preTouched) preEl.value = pl.prefix || '';
+          const parts = pl.parts || [];
+          rowsEl.innerHTML = parts.length
+            ? parts
+                .map(
+                  (p) => `<tr>
+                    <td class="num">${p.index + 1}</td>
+                    <td>${p.from === p.to ? p.from : p.from + '–' + p.to}</td>
+                    <td class="num">${p.pages}</td>
+                    <td class="fn" title="${esc(p.path)}">${esc(p.file)}${
+                      p.exists ? '<span class="sp-tag">已存在</span>' : ''
+                    }</td></tr>`
+                )
+                .join('')
+            : '<tr><td colspan="4" class="muted">没有分段</td></tr>';
+          const dup = pl.duplicated && pl.duplicated.length;
+          const gap = pl.uncovered && pl.uncovered.length;
+          sumEl.innerHTML =
+            `共 <b>${pl.part_count}</b> 个文件 · 覆盖 <b>${pl.unique_pages}</b>/${pl.page_count} 页` +
+            (dup ? ` · <span class="sp-warn-t">有页面重复</span>` : '') +
+            (gap ? ` · <span class="sp-warn-t">有页面遗漏</span>` : '');
+          warnEl.innerHTML = (pl.warnings || [])
+            .map((w) => `<div class="sp-warn">${esc(w)}</div>`)
+            .join('');
+          if (pl.mode === 'every') {
+            body.querySelector('#sp-every-calc').textContent = `${pl.part_count} 份`;
+          }
+          if (pl.mode === 'toc') {
+            body.querySelector('#sp-toc-calc').textContent = `${pl.part_count} 份`;
+          }
+          if (btns.ok) btns.ok.disabled = !parts.length;
+        }
+
+        async function preview() {
+          if (st.running) return;
+          if (st.timer) {
+            clearTimeout(st.timer);
+            st.timer = 0;
+          }
+          sumEl.textContent = '正在计算…';
+          try {
+            const pl = await api('/api/split/plan', { json: payload() });
+            srcNameEl.textContent = baseName(pl.source) || '（未保存的文档）';
+            srcMetaEl.innerHTML =
+              `${st.srcPath ? '单独选择' : '当前文档'} · ${pl.page_count} 页` +
+              (st.srcPath
+                ? ' · <a href="#" id="sp-src-back">改回当前文档</a>'
+                : S.path ? '' : ' · 尚未保存');
+            const backSrc = srcMetaEl.querySelector('#sp-src-back');
+            if (backSrc) {
+              backSrc.onclick = (ev2) => {
+                ev2.preventDefault();
+                st.srcPath = '';
+                st.outTouched = false;
+                st.preTouched = false;
+                preview();
+              };
+            }
+            renderPlan(pl);
+          } catch (e) {
+            renderError(e.message);
+          }
+        }
+        const schedule = () => {
+          clearTimeout(st.timer);
+          st.timer = setTimeout(preview, 260);
+        };
+
+        rangesEl.oninput = schedule;
+        everyEl.oninput = schedule;
+        levelEl.onchange = () => preview();
+        outEl.oninput = () => {
+          st.outTouched = true;
+          schedule();
+        };
+        preEl.oninput = () => {
+          st.preTouched = true;
+          schedule();
+        };
+        overEl.onchange = () => {
+          if (overEl.checked && st.plan && st.plan.conflicts.length) schedule();
+        };
+
+        /* 换输出目录：复用系统文件框太别扭，这里给一个"目录列表"弹层 ——
+           但它会和主弹窗抢同一个 #modal，所以改成在弹窗内就地展开目录。 */
+        body.querySelector('#sp-browse-dir').onclick = () => {
+          const box = document.createElement('div');
+          box.className = 'sp-browser';
+          box.innerHTML = '<div class="path">加载中…</div>';
+          outEl.parentElement.parentElement.appendChild(box);
+          const name = (p) => p.replace(/\\/g, '/').split('/').filter(Boolean).pop() || p;
+          (async () => {
+            let cur = outEl.value.trim();
+            if (!cur) cur = '';
+            async function nav(p) {
+              try {
+                const r = await api('/api/browse' + (p ? '?dir=' + encodeURIComponent(p) : ''));
+                box.innerHTML = `<div class="path">${esc(r.dir)}</div>`;
+                const up = document.createElement('div');
+                up.className = 'item';
+                up.textContent = '↑ 上级目录';
+                up.onclick = () => nav(r.parent);
+                box.appendChild(up);
+                r.items.filter((it) => it.dir).forEach((it) => {
+                  const row = document.createElement('div');
+                  row.className = 'item';
+                  row.innerHTML = `<span>📁 ${esc(it.name)}</span>`;
+                  row.onclick = () => nav(it.path);
+                  box.appendChild(row);
+                });
+                const pick = document.createElement('div');
+                pick.className = 'item sp-pick-here';
+                pick.innerHTML = `<span>✓ 用这个目录：${esc(name(r.dir))}</span>`;
+                pick.onclick = () => {
+                  outEl.value = r.dir;
+                  st.outTouched = true;
+                  box.remove();
+                  preview();
+                };
+                box.appendChild(pick);
+              } catch (e) {
+                box.innerHTML = `<div class="path">${esc(e.message)}</div>`;
+              }
+            }
+            nav(cur);
+          })();
+        };
+
+        /* 选另一份 PDF：走系统文件框上传到临时目录，不打开成新文档 */
+        body.querySelector('#sp-pick').onclick = async () => {
+          const f = await pickFile('pdf');
+          if (!f) return;
+          try {
+            const fd = new FormData();
+            fd.append('file', f);
+            const res = await fetch('/api/upload?no_open=1', { method: 'POST', body: fd });
+            const j = await res.json();
+            if (!j.ok) throw new Error(j.error.message);
+            st.srcPath = j.data.path;
+            st.outTouched = false;
+            st.preTouched = false;
+            preview();
+          } catch (e) {
+            toast(e.message, 'err');
+          }
+        };
+
+        function showJob(j) {
+          if (j.state === 'running') {
+            const done = Math.min(j.done || 0, j.total || 0);
+            const pct = j.total ? Math.round((done / j.total) * 100) : 8;
+            barEl.style.width = Math.max(4, pct) + '%';
+            progText.textContent =
+              `正在导出 ${Math.min(done + 1, j.total || done + 1)}/${j.total || '?'}` +
+              (j.current ? ` · ${j.current}` : '');
+            return;
+          }
+          st.running = false;
+          progEl.hidden = true;
+          doneEl.hidden = false;
+          body.scrollTop = 0;
+          const files = j.files || [];
+          if (j.state === 'error') {
+            const e = j.error || {};
+            doneEl.innerHTML = `<div class="sp-done-head sp-bad">分割失败</div>
+              <div class="hint warn">${esc(e.message || '未知错误')}</div>
+              <div class="actions"><button class="btn" id="sp-back">返回修改</button></div>`;
+          } else {
+            doneEl.innerHTML = `
+              <div class="sp-done-head">${j.state === 'cancelled' ? '已取消' : `已导出 ${files.length} 个文件`}</div>
+              <div class="sp-done-dir">${esc(j.out_dir || '')}</div>
+              <div class="sp-files">${files
+                .map(
+                  (f) => `<div class="sp-file">
+                    <span class="sf-name" title="${esc(f.path)}">${esc(f.file)}</span>
+                    <span class="sf-meta">${f.from === f.to ? '第 ' + f.from + ' 页' : '第 ' + f.from + '–' + f.to + ' 页'} · ${f.pages} 页 · ${fmtSize(f.bytes)}</span>
+                    <button class="btn small" data-open="${esc(f.path)}">打开</button>
+                  </div>`
+                )
+                .join('')}</div>
+              ${(j.warnings || []).map((w) => `<div class="sp-warn">${esc(w)}</div>`).join('')}
+              <div class="actions">
+                <button class="btn" id="sp-again">再分一批</button>
+                <button class="btn primary" id="sp-done-close">完成</button>
+              </div>`;
+          }
+          doneEl.querySelectorAll('[data-open]').forEach((b) => {
+            b.onclick = async () => {
+              try {
+                const info = await api('/api/open', { json: { path: b.dataset.open } });
+                await loadInfo(info);
+                close(null);
+                toast('已打开 ' + baseName(b.dataset.open), 'ok');
+              } catch (e) {
+                toast(e.message, 'err');
+              }
+            };
+          });
+          const again = doneEl.querySelector('#sp-again');
+          if (again) again.onclick = resetToForm;
+          const dc = doneEl.querySelector('#sp-done-close');
+          if (dc) dc.onclick = () => close(null);
+          const back2 = doneEl.querySelector('#sp-back');
+          if (back2) back2.onclick = resetToForm;
+          if (btns.cancel) btns.cancel.textContent = '关闭';
+          // 结果区自带「再分一批 / 完成」，底部整栏就让出来（否则同一件事有两个按钮）
+          if (btns.ok) {
+            btns.ok.style.display = 'none';
+            btns.ok.parentElement.hidden = true;
+          }
+          if (btns.cancel) btns.cancel.style.display = 'none';
+        }
+
+        async function poll() {
+          // 弹窗被关掉/换成别的对话框就别再轮询了（后端的活照常跑完，文件照样落到磁盘）
+          if (!document.body.contains(formEl) || !$('#modal').classList.contains('show')) return;
+          let j = null;
+          try {
+            j = await api('/api/split/job?id=' + encodeURIComponent(st.job));
+          } catch (e) {
+            st.running = false;
+            progEl.hidden = true;
+            formEl.hidden = false;
+            if (btns.ok) btns.ok.disabled = false;
+            return toast(e.message, 'err');
+          }
+          showJob(j);
+          if (j.state === 'running') setTimeout(poll, 350);
+        }
+
+        /* 主按钮：开始分割。跑的过程中不关窗，结果留在弹窗里 */
+        async function startSplit() {
+          if (st.running) return;
+          // 刚改完参数就点开始（防抖还没到）：先按最新输入重算一遍，
+          // 免得"预览是 2 份、实际切出 3 份"
+          if (st.timer) {
+            clearTimeout(st.timer);
+            st.timer = 0;
+            await preview();
+          }
+          if (!st.plan || !st.plan.parts || !st.plan.parts.length) {
+            return toast('先填好页码范围', 'err');
+          }
+          if (st.plan.conflicts && st.plan.conflicts.length && !overEl.checked) {
+            return toast(`有 ${st.plan.conflicts.length} 个同名文件，勾选「覆盖同名文件」后才能继续`, 'err');
+          }
+          st.running = true;
+          btns.ok.disabled = true;
+          if (btns.cancel) btns.cancel.disabled = true;
+          formEl.hidden = true;
+          doneEl.hidden = true;
+          progEl.hidden = false;
+          barEl.style.width = '4%';
+          progText.textContent = '准备中…';
+          try {
+            const r = await api('/api/split', { json: payload() });
+            st.job = r.job_id;
+            setTimeout(poll, 200);
+          } catch (e) {
+            st.running = false;
+            progEl.hidden = true;
+            formEl.hidden = false;
+            btns.ok.disabled = false;
+            if (btns.cancel) btns.cancel.disabled = false;
+            toast(e.message, 'err');
+          }
+        }
+
+        function resetToForm() {
+          doneEl.hidden = true;
+          doneEl.innerHTML = '';
+          formEl.hidden = false;
+          overEl.checked = false;
+          if (btns.cancel) btns.cancel.textContent = '取消';
+          if (btns.ok) {
+            btns.ok.parentElement.hidden = false;
+            btns.ok.style.display = '';
+            btns.ok.textContent = '开始分割';
+            btns.ok.disabled = false;
+            btns.ok.onclick = startSplit;
+          }
+          if (btns.cancel) btns.cancel.style.display = '';
+          preview();
+        }
+
+        if (btns.ok) btns.ok.onclick = startSplit;
+
+        body.querySelector('#sp-cancel').onclick = async () => {
+          if (!st.job) return;
+          try {
+            await api('/api/split/cancel', { json: { id: st.job } });
+            progText.textContent = '正在取消（做完手上这一份就停）…';
+          } catch (e) {
+            toast(e.message, 'err');
+          }
+        };
+
+        preview();
+      },
+      // 任务交给上面的自定义按钮处理，这里只是别让 dialog 自己关窗
+      onOk: () => false,
+    });
+  }
+  $('#btn-split').onclick = () => openSplitDialog();
+
   /* ---- 保存 ---- */
   async function defaultSavePath() {
     let dir = '';
@@ -2564,7 +3056,7 @@
       // 缺任何一项新能力都算旧服务端：新前端会调到它没有的接口，用户只会觉得"点了没反应"
       // erase.guarded = /api/erase 已要求显式 allow_content，旧服务端会直接擦掉正文
       const need = ['text.transform', 'canvas.layered', 'erase.guarded', 'ocr.optional',
-        'bitmap.cached', 'image.clipboard'];
+        'bitmap.cached', 'image.clipboard', 'split.batch'];
       if (!j.ok || need.some((k) => !caps.includes(k))) {
         throw new Error('stale');
       }

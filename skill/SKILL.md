@@ -47,6 +47,8 @@ auto_trigger:
    Web 界面内部换算用**实测比例**「`.pbox` 实际宽度 ÷ 该页 pt 宽度」，`zoom × 96/72`
    只用于生成布局尺寸 —— 这样不同 DPI / 浏览器缩放 / 系统缩放下落点才一致。
    **页码一律 0 基**：`--page 0` 是第一页，`--pages "0-2"` 是前三页。
+   唯一例外是 `pdfx split` 的 `--ranges`：那是用户手写的"第几页到第几页"，
+   **1 基、闭区间**（`1-10` ＝ 第 1~10 页，共 10 页）。
 2. **先 list 再操作**。每个对象都有 id，但**编辑后 id 可能变化**，每次编辑完要重新 list。
 3. **默认写回原文件**。想保留原件必须加 `-o 新路径.pdf`，或先 `--no-save` 做多步再 `save`。
 
@@ -93,6 +95,7 @@ pdfx search "a.pdf" "要核对的词"          # 4. 验证：新内容能搜到�
 | 检索 | `pdfx search a.pdf "关键词" [--pages "0-2"] [--regex] [--ocr]` |
 | 导出文本 | `pdfx extract a.pdf -o out.txt [--ocr]` |
 | 渲染预览 | `pdfx render a.pdf --page 0 --dpi 150 -o p0.png` |
+| 批量分割 | `pdfx split a.pdf --ranges "1-10,11-30,31-40" -d out/`（1 基闭区间，`1-10:封面` 可起名）／`--every 50` 每 50 页一份／`--toc --level 1` 按目录章切；`--dry-run` 只看不写；`--overwrite` 覆盖同名 |
 | 起服务 | `pdfx serve a.pdf --port 8765` （浏览器编辑器 + REST API） |
 
 所有命令默认输出**单行 JSON**：`{"ok":true,"data":{...},"warnings":[]}`；失败退出码非 0 且
@@ -167,7 +170,16 @@ for i in 0 1 2; do
 done
 ```
 
-**C. 删掉某页上的一段话（结构化）**
+**C. 一本书按章节拆成多个 PDF**
+
+```bash
+pdfx split "教材.pdf" --toc --level 1 --dry-run          # 先看目录会切出哪几份
+pdfx split "教材.pdf" --toc --level 1 -d "教材_分册"      # 确认后执行（同名文件默认拒绝）
+pdfx split "教材.pdf" --ranges "1-10, 11-30, 31-40" -d out/ --dry-run   # 只打印计划
+```
+`--ranges` 是 **1 基闭区间**；`1-10, 2-30` 这种重叠写法允许，重复页会在 warnings 里点名。
+
+**D. 删掉某页上的一段话（结构化）**
 
 ```bash
 pdfx text list "a.pdf" --page 2 | head -c 2000   # 找 id
@@ -251,6 +263,10 @@ pdfx serve a.pdf --port 8765        # 打开 http://127.0.0.1:8765
 | POST | `/api/ink` `/api/ink/erase` | `{page, strokes}` / `{page, points|bbox, radius, mode}` |
 | POST | `/api/erase` | `{page, points|rects, radius, allow_content?, erase_text?}`。**默认只切笔迹**（等价 `ink/erase --mode cut`）；擦页面内容必须显式 `allow_content: true`，此时文字真删 + 图像涂纸色，返回 `{removed_text_count, covered, strokes_removed, fill}` |
 | POST | `/api/page` `/api/page/move` | 页面增删移 |
+| POST | `/api/split/plan` | `{mode:"ranges"\|"every"\|"toc", ranges?, every?, level?, out_dir?, prefix?, path?}` → 只算不写：每段的页码/页数/文件名、是否已存在、重复页、遗漏页、warnings |
+| POST | `/api/split` | 同上参数 + `overwrite?`，**起后台任务**，立刻返回 `{job_id, plan}`；同名文件默认整批拒绝（`exists`） |
+| GET | `/api/split/job?id=` | 轮询进度 `{state: running\|done\|error\|cancelled, done, total, current, files:[{file,path,pages,bytes}], out_dir}` |
+| POST | `/api/split/cancel` | `{id}` 在"每份之间"停下，已完成的份数保留 |
 | POST | `/api/save` `/api/undo` | 落盘（新文档要带 `path` + `as_current`）/ 撤销 |
 
 > 所有带 `doc=` 的请求都可指定文档；不传则用当前文档。
@@ -273,6 +289,13 @@ with PDFDocument("a.pdf") as d:
     d.update_text(0, "p0:o57,429", "新内容")     # 两类 PDF 同一套调用
     print(d.search("新内容")["total"])
     png = d.image_png(0, "p0:i@56,500")         # 取某张图 → PNG bytes（复制/转存都够用）
+
+    # 批量分割：先出计划（不写盘），再执行
+    plan = d.split_plan(mode="ranges", ranges="1-10, 11-30, 31-40", out_dir="out")
+    for part in plan["parts"]:
+        print(part["from"], part["to"], part["file"], part["exists"])
+    d.split_export(plan, overwrite=False)       # 返回 {files, written, warnings}
+    # 其它两种切法：mode="every" + every=50；mode="toc" + level=1
 ```
 
 ## 错误码
@@ -290,6 +313,10 @@ with PDFDocument("a.pdf") as d:
 | `image_is_background` | 要移动的图片占了页面 60% 以上，多半是扫描页那张整页底图，删了等于擦掉整页 | 这是页面本身，不是可移动元素；要改就重建页面 |
 | `file_locked` | 原文件被其他程序（阅读器、同步盘）占用，无法原子替换 | 关掉占用程序重试，或 `save` 到新路径 |
 | `document_closed` | 会话里的文档已被关闭（服务重启过、或同文档被重开） | 重新 `open` |
+| `bad_range` / `empty_ranges` | 分割的页码范围写错（倒序、0 起、看不懂） | 写成 `1-10`、`5`、`1-`，逗号/换行分隔 |
+| `exists` | 分割的目标文件已存在 | 换输出目录，或显式 `overwrite=True` / `--overwrite` |
+| `no_toc` | 想按目录切，但这份 PDF 没有书签 | 改用 `--ranges` 或 `--every` |
+| `no_job` | 分割任务 id 不存在（服务重启过） | 重新发起 |
 
 ## 图片的 id 为什么按位置
 id 形如 `p0:i@56,500`（左上角坐标取整），**不带 xref**。原因：`insert_image` 会复用
@@ -323,6 +350,11 @@ id 形如 `p0:i@56,500`（左上角坐标取整），**不带 xref**。原因：
 - **对象会重叠，位置不可靠**：插入的图片/文本压在原文之上，`objects` 里同一坐标可能同时
   命中文本和图片。要操作底下那个，用 `--id` 精确指定；只靠坐标取「离得最近」会拿错。
   UI 的命中按层叠顺序（笔迹 > 用户插入的 > PDF 原有的，同层比面积），不是按面积全局取最小。
+- **分割的页码是 1 基，其余接口是 0 基**。`--ranges "1-10"` 是第 1~10 页（共 10 页）；
+  同一份文件里 `--page 9` 指的是第 10 页。脚本里混用时记得 `ranges` 不用减 1。
+- **分割会重排对象号**：`insert_pdf` 之后页 xref 变了，状态（用户文本框/笔迹）是按 xref 存的，
+  所以 `split.py` 是"先保存、再打开写状态、追加保存"。自己拿 PyMuPDF 拆完再塞 `PDFXState`
+  必须按新 xref 重映射，否则导出的文件里文本框会退化成普通文字。
 - **`image transform` 会真的删掉原图**：走的是 redaction（`images=REMOVE`、`text=NONE`、
   `graphics=NONE`），所以底下被它遮住的文字会重新露出来、不会留白斑。
   反过来说，原位下方原本没有内容时就变空白 —— 这是不可逆的，除非 `undo`。

@@ -7,7 +7,8 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const BASE_ARG = process.argv[2];
@@ -1402,6 +1403,107 @@ async function main() {
     race.ks && race.ks.length >= 3 && race.spread < 0.01,
     `k 极差 ${race.spread != null ? race.spread.toFixed(4) : 'n/a'}`);
   await shot('cross-device');
+
+  /* ---------------------------------------------------------------- 批量分割 */
+  console.log('\n== 批量分割 ==');
+  const splitDir = join(process.cwd(), 'tmp', 'uitest_split');
+  // 上一轮的产物必须清掉：目标已存在时后端会整批拒绝（这是对的，但会让测试假失败）
+  rmSync(splitDir, { recursive: true, force: true });
+  const spEntry = await ev(`(() => {
+    const b = document.querySelector('#btn-split');
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    return { w: Math.round(r.width), h: Math.round(r.height), text: b.textContent.trim(),
+             inView: r.bottom <= innerHeight + 1 && r.left >= 0 && r.right <= innerWidth };
+  })()`);
+  check('侧栏有「分割导出」入口且可见', !!spEntry && spEntry.w > 60 && spEntry.h >= 20 && spEntry.inView,
+    spEntry ? `${spEntry.w}×${spEntry.h} 「${spEntry.text}」` : '找不到按钮');
+
+  await ev(`document.querySelector('#btn-split').click()`);
+  await sleep(900);
+  const sp1 = await ev(`(() => ({
+    shown: document.querySelector('#modal').classList.contains('show'),
+    title: document.querySelector('#modal-title').textContent,
+    rows: document.querySelectorAll('#sp-rows tr').length,
+    out: document.querySelector('#sp-outdir').value,
+    prefix: document.querySelector('#sp-prefix').value,
+    summary: document.querySelector('#sp-summary').textContent,
+    okDisabled: !!document.querySelector('#modal-foot .btn.primary').disabled,
+  }))()`);
+  check('点开就是实时预览（已有一段示例范围）',
+    sp1.shown && /分割/.test(sp1.title) && sp1.rows >= 1 && !sp1.okDisabled,
+    `${sp1.title}｜${sp1.rows} 行｜${sp1.summary}`);
+  check('默认输出目录与前缀都已填好', /[\\/]/.test(sp1.out) && !!sp1.prefix, `${sp1.out} ｜ ${sp1.prefix}`);
+
+  // 改成两段各自一页
+  await ev(`(() => { const t = document.querySelector('#sp-ranges');
+    t.value = '1-1\\n2-2'; t.dispatchEvent(new Event('input')); })()`);
+  await sleep(800);
+  const sp2 = await ev(`(() => ({
+    rows: document.querySelectorAll('#sp-rows tr').length,
+    files: [...document.querySelectorAll('#sp-rows .fn')].map((e) => e.textContent.trim()),
+  }))()`);
+  check('改页码范围后预览跟着变（2 段 → 2 行）', sp2.rows === 2, sp2.files.join(' / '));
+
+  await ev(`document.querySelector('.sp-mode[data-mode="every"]').click()`);
+  await sleep(700);
+  const spEvery = await ev(`(() => ({
+    calc: document.querySelector('#sp-every-calc').textContent.trim(),
+    rows: document.querySelectorAll('#sp-rows tr').length,
+  }))()`);
+  check('「每 N 页」模式给出预计份数', /份/.test(spEvery.calc) && spEvery.rows >= 1, spEvery.calc);
+
+  await ev(`document.querySelector('.sp-mode[data-mode="toc"]').click()`);
+  await sleep(700);
+  const spToc = await ev(`(() => ({
+    text: document.querySelector('#sp-rows').innerText.trim(),
+    disabled: !!document.querySelector('#modal-foot .btn.primary').disabled,
+  }))()`);
+  check('没有书签的文档选「按目录」会说明原因并禁用开始',
+    /没有可用目录|没有目录/.test(spToc.text) && spToc.disabled, spToc.text.slice(0, 40));
+
+  // 回到页码模式，指定输出目录后真的切
+  await ev(`document.querySelector('.sp-mode[data-mode="ranges"]').click()`);
+  await sleep(600);
+  await ev(`(() => { const t = document.querySelector('#sp-outdir');
+    t.value = ${JSON.stringify(splitDir)}; t.dispatchEvent(new Event('input')); })()`);
+  await sleep(800);
+  await ev(`(() => { const t = document.querySelector('#sp-ranges');
+    t.value = '1-1\\n2-2'; t.dispatchEvent(new Event('input')); })()`);
+  await sleep(800);
+  await ev(`document.querySelector('#modal-foot .btn.primary').click()`);
+  let spDone = null;
+  for (let i = 0; i < 80; i++) {
+    spDone = await ev(`(() => {
+      const d = document.querySelector('#sp-done');
+      if (!d || d.hidden) return null;
+      return { text: d.innerText, files: [...d.querySelectorAll('.sp-file .sf-name')].map((e) => e.textContent.trim()) };
+    })()`);
+    if (spDone) break;
+    await sleep(250);
+  }
+  check('点「开始分割」后跑完并给出结果', !!spDone && /已导出 2 个文件/.test(spDone.text),
+    spDone ? spDone.text.split('\n')[0] : '等不到结果');
+  const onDisk = existsSync(splitDir) ? readdirSync(splitDir).filter((f) => f.endsWith('.pdf')) : [];
+  check('结果文件真的写到了磁盘上', onDisk.length === 2, onDisk.join(' / '));
+  check('结果里的文件名与磁盘一致',
+    !!spDone && spDone.files.every((f) => onDisk.includes(f)), (spDone ? spDone.files : []).join(' / '));
+  check('完成后弹窗里不再重复出现表单', spDone ? !/页码范围/.test(spDone.text) : false);
+  await shot('split-done');
+
+  // 再分一批：回到表单，应该重新预览
+  await ev(`document.querySelector('#sp-done #sp-again').click()`);
+  await sleep(800);
+  const spAgain = await ev(`(() => ({
+    formShown: !document.querySelector('#sp-form').hidden,
+    doneShown: !document.querySelector('#sp-done').hidden,
+    okText: document.querySelector('#modal-foot .btn.primary').textContent.trim(),
+  }))()`);
+  check('「再分一批」回到表单且预填还在', spAgain.formShown && !spAgain.doneShown && /开始分割/.test(spAgain.okText),
+    spAgain.okText);
+  await ev(`document.querySelector('#modal-x').click()`);
+  await sleep(300);
+  check('关掉弹窗后遮罩消失', !(await ev(`document.querySelector('#modal').classList.contains('show')`)));
 
   console.log(`\n合计 ${pass} 项通过，${fail} 项失败`);
   if (errors.length) {
