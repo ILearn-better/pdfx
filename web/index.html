@@ -8,16 +8,51 @@
 </head>
 <body>
 <header class="topbar">
+  <!-- 左段可横滚：窗口窄时品牌/菜单/工具/搜索可以滚，右段的视图·缩放·OCR 永远留在可视区 -->
+  <div class="tb-left">
   <div class="brand"><span class="dot"></span>pdfx</div>
 
-  <div class="group">
-    <button class="btn" id="btn-open" title="打开已有 PDF">打开</button>
-    <button class="btn" id="btn-new" title="新建一份独立文档">新建</button>
-    <button class="btn" id="btn-insert-pdf" title="把另一个 PDF 的页面插入当前文档">插入PDF</button>
-    <button class="btn" id="btn-save" title="保存 (Ctrl+S)">保存</button>
-    <button class="btn ghost" id="btn-undo" title="撤销 (Ctrl+Z)">撤销</button>
-    <button class="btn ocr-toggle" id="btn-ocr-top" title="扫描件没有文字层：点一下识别本页文字（约 1~3 秒）">本页 OCR 关</button>
-  </div>
+  <nav class="menubar" id="menubar">
+    <div class="menu" data-menu="file">
+      <button class="menu-btn" aria-haspopup="true" aria-expanded="false" title="新建 / 打开 / 保存 / 插入 / 撤销">文件</button>
+      <div class="menu-pop" role="menu">
+        <button class="mi" role="menuitem" id="btn-new"><span class="mi-t">新建空白文档</span><kbd>Ctrl N</kbd></button>
+        <button class="mi" role="menuitem" id="btn-open"><span class="mi-t">打开 PDF…</span><kbd>Ctrl O</kbd></button>
+        <div class="mi-sep"></div>
+        <button class="mi" role="menuitem" id="btn-save"><span class="mi-t">保存</span><kbd>Ctrl S</kbd></button>
+        <button class="mi" role="menuitem" id="btn-saveas"><span class="mi-t">另存为…</span></button>
+        <div class="mi-sep"></div>
+        <button class="mi" role="menuitem" id="btn-insert-pdf">
+          <span class="mi-t">插入其他 PDF 的页面…</span><span class="mi-mark"></span>
+        </button>
+        <div class="mi-sep"></div>
+        <button class="mi" role="menuitem" id="btn-undo"><span class="mi-t">撤销</span><kbd>Ctrl Z</kbd></button>
+      </div>
+    </div>
+
+    <div class="menu" data-menu="feat">
+      <button class="menu-btn" aria-haspopup="true" aria-expanded="false" title="分割导出 / OCR / 页面 / 快捷键">功能</button>
+      <div class="menu-pop" role="menu">
+        <button class="mi" role="menuitem" id="btn-split">
+          <span class="mi-t">分割导出…
+            <span class="mi-sub">按页码范围 / 每 N 页 / 目录拆成多个 PDF</span>
+          </span><span class="mi-mark"></span>
+        </button>
+        <div class="mi-sep"></div>
+        <button class="mi" role="menuitem" id="btn-ocr-menu">
+          <span class="mi-t">本页 OCR 识别</span><span class="mi-state" id="mi-ocr-state">关闭</span>
+        </button>
+        <button class="mi" role="menuitem" id="btn-showtext">
+          <span class="mi-t">显示文本块边界</span><span class="mi-mark"></span>
+        </button>
+        <div class="mi-sep"></div>
+        <button class="mi" role="menuitem" id="btn-add-page"><span class="mi-t">添加一页</span><span class="mi-mark"></span></button>
+        <button class="mi danger" role="menuitem" id="btn-del-page"><span class="mi-t">删除本页</span><span class="mi-mark"></span></button>
+        <div class="mi-sep"></div>
+        <button class="mi" role="menuitem" id="btn-keys"><span class="mi-t">快捷键一览</span><kbd>?</kbd></button>
+      </div>
+    </div>
+  </nav>
 
   <div class="divider"></div>
 
@@ -48,9 +83,9 @@
     <input id="q" type="search" placeholder="全文检索（自动 OCR）…" autocomplete="off" />
     <button class="btn ghost" id="btn-search">检索</button>
   </div>
+  </div>
 
-  <div class="spacer"></div>
-
+  <div class="tb-right">
   <div class="group viewswitch" id="viewswitch">
     <button class="btn icon vbtn active" data-view="single" title="单页（上下滚动查看当前页）">
       <svg viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="18" rx="1.5" fill="none" stroke-width="2"/></svg>
@@ -61,9 +96,6 @@
     <button class="btn icon vbtn" data-view="horiz" title="横向（左右滚动翻页）">
       <svg viewBox="0 0 24 24"><rect x="3" y="4" width="7" height="16" rx="1" fill="none" stroke-width="2"/><rect x="13" y="4" width="7" height="16" rx="1" fill="none" stroke-width="2"/></svg>
     </button>
-    <button class="btn icon vbtn" id="btn-showtext" title="显示文本块边界">
-      <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="5" rx="1" fill="none" stroke-width="1.8"/><rect x="3" y="11" width="13" height="4" rx="1" fill="none" stroke-width="1.8"/><rect x="3" y="17" width="16" height="3" rx="1" fill="none" stroke-width="1.8"/></svg>
-    </button>
   </div>
 
   <div class="group zoom">
@@ -71,10 +103,9 @@
     <span id="zoom-label">100%</span>
     <button class="btn icon" id="zoom-in">+</button>
   </div>
-  <button class="btn icon" id="btn-keys" title="快捷键一览 (?)">
-    <svg viewBox="0 0 24 24"><rect x="2.5" y="6.5" width="19" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M6 10.5h.01M9.4 10.5h.01M12.8 10.5h.01M16.2 10.5h.01M6 13.6h.01M9.4 13.6h.01M12.8 13.6h.01M16.2 13.6h.01M8.4 16.2h7.2" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" fill="none"/></svg>
-  </button>
+  <button class="btn ocr-toggle" id="btn-ocr-top" title="扫描件没有文字层：点一下识别本页文字（约 1~3 秒）">本页 OCR 关</button>
   <div class="ocr-badge" id="ocr-badge" title="OCR 引擎状态">OCR</div>
+  </div>
 </header>
 
 <div class="stale-bar" id="stale-bar" hidden>
@@ -99,19 +130,13 @@
       </div>
       <div class="thumbs" id="thumbs"></div>
     </div>
-
-    <div class="side-foot">
-      <button class="btn small" id="btn-add-page">+ 添加页</button>
-      <button class="btn small ghost" id="btn-del-page">删除本页</button>
-      <button class="btn small" id="btn-split" title="按页码范围 / 每 N 页 / 目录，把这份 PDF 拆成多个文件">分割导出…</button>
-    </div>
   </aside>
 
   <section class="stage-wrap" id="stage-wrap">
     <div class="pages" id="pages">
       <div class="empty-state" id="empty-hint">
         <h2>打开或新建一份 PDF</h2>
-        <p>点左上角「打开」选文件，或直接把 PDF 拖进这个窗口。</p>
+        <p>点左上角「文件 → 打开 PDF」，或直接把 PDF 拖进这个窗口。</p>
         <div class="empty-actions">
           <button class="btn primary" id="btn-empty-open">打开 PDF</button>
           <button class="btn" id="btn-empty-new">新建空白文档</button>

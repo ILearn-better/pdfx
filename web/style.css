@@ -41,28 +41,87 @@ button { font: inherit; }
 /* ------------------------------------------------------------------ 顶栏 */
 .topbar {
   height: 50px;
+  flex: none;              /* body 是 flex column：不加这条，画布内容一高就把顶栏压扁 */
   display: flex; align-items: center; gap: 10px;
   padding: 0 14px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
   position: relative; z-index: 20;
-  /* 窄屏时宁可整体横滚，也不要把右边的按钮挤出可视区（用户就找不到 OCR 开关了） */
+  overflow: hidden;
+}
+/* 左段（品牌 / 菜单 / 工具 / 搜索）窄屏时自己横滚；
+   右段（视图 / 缩放 / OCR）永远钉在可视区，不会再被挤出屏幕 */
+.tb-left {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; align-items: center; gap: 10px;
   overflow-x: auto; overflow-y: hidden;
   scrollbar-width: none;
 }
-.topbar::-webkit-scrollbar { display: none; }
+.tb-left::-webkit-scrollbar { display: none; }
+.tb-right { flex: none; display: flex; align-items: center; gap: 8px; }
 
 .brand {
   font-weight: 700; font-size: 15px; letter-spacing: .3px;
   display: flex; align-items: center; gap: 7px; margin-right: 4px;
+  flex: none;
 }
 .brand .dot {
   width: 9px; height: 9px; border-radius: 3px;
   background: linear-gradient(135deg, #1f6feb, #7c3aed);
 }
 
-.group { display: flex; align-items: center; gap: 6px; }
-.divider { width: 1px; height: 22px; background: var(--line); }
+/* ---- 菜单栏：文件 / 功能 ---- */
+.menubar { display: flex; align-items: center; gap: 2px; flex: none; }
+.menu { position: relative; }
+.menu-btn {
+  height: 30px; padding: 0 11px;
+  border: 1px solid transparent; border-radius: 7px;
+  background: transparent; color: var(--text);
+  font-size: 13px; cursor: pointer; white-space: nowrap;
+}
+.menu-btn:hover { background: #eef1f5; }
+.menu.open > .menu-btn { background: var(--primary-weak); border-color: #c7dbfb; color: var(--primary); }
+
+/* 弹出层必须是 fixed：顶栏为了窄屏横滚设了 overflow-x:auto，
+   绝对定位的子元素会被裁掉 —— 菜单"点开却看不见"。坐标由 JS 在打开时算。 */
+.menu-pop {
+  position: fixed; top: 0; left: 0;
+  min-width: 238px; padding: 5px;
+  background: #fff; border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(16, 24, 40, .15), 0 1px 2px rgba(16, 24, 40, .06);
+  display: none; z-index: 300;
+}
+.menu.open > .menu-pop { display: block; }
+
+.mi {
+  width: 100%; min-height: 32px; padding: 6px 9px;
+  display: flex; align-items: center; gap: 10px;
+  border: 0; border-radius: 7px; background: transparent;
+  color: var(--text); font-size: 12.5px; text-align: left; cursor: pointer;
+}
+.mi:hover { background: var(--primary-weak); }
+.mi .mi-t { flex: 1; min-width: 0; display: block; white-space: nowrap; }
+.mi .mi-sub {
+  display: block; font-size: 11px; color: var(--muted);
+  margin-top: 3px; white-space: normal; line-height: 1.35;
+}
+.mi kbd {
+  font: 11px/1 ui-monospace, "SF Mono", Consolas, monospace;
+  color: var(--muted); background: #f1f3f7; border: 1px solid var(--line);
+  border-radius: 4px; padding: 3px 5px; white-space: nowrap; flex: none;
+}
+.mi .mi-state { font-size: 11px; color: var(--muted); white-space: nowrap; flex: none; }
+.mi.active .mi-state { color: var(--primary); font-weight: 600; }
+.mi-mark { width: 13px; flex: none; text-align: center; color: var(--primary); font-size: 12px; }
+.mi.active .mi-mark::before { content: '✓'; }
+.mi.danger .mi-t { color: #b4342f; }
+.mi.danger:hover { background: #fdecec; }
+.mi-sep { height: 1px; background: var(--line); margin: 5px 7px; }
+
+/* 顶栏里所有控件都不许被压缩：空间不够时交给 overflow-x 横滚，
+   否则工具按钮的文字会被挤成竖排、图标和标签各占一行 */
+.group { display: flex; align-items: center; gap: 6px; flex: none; }
+.divider { width: 1px; height: 22px; background: var(--line); flex: none; }
 .spacer { flex: 1; }
 
 .btn {
@@ -84,7 +143,7 @@ button { font: inherit; }
 
 .tools { gap: 2px; }
 .tool {
-  width: 54px; height: 40px;
+  width: 54px; height: 40px; flex: none;
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
   border: 1px solid transparent; border-radius: 8px;
   background: transparent; color: var(--muted); cursor: pointer;
@@ -95,12 +154,14 @@ button { font: inherit; }
 .tool:hover { background: #f1f4f8; color: var(--text); }
 .tool.active { background: var(--primary-weak); color: var(--primary); border-color: #c7dbfb; }
 
-.searchbox { display: flex; align-items: center; gap: 6px; }
+/* 搜索框是顶栏里唯一允许"缩"的东西：窄屏先缩它，实在不够才轮到左段横滚 */
+.searchbox { display: flex; align-items: center; gap: 6px; flex: 0 1 auto; min-width: 126px; }
 .searchbox input[type="search"] {
-  width: 172px; height: 30px; padding: 0 10px;
+  width: 172px; flex: 0 1 172px; min-width: 58px; height: 30px; padding: 0 10px;
   border: 1px solid var(--line-strong); border-radius: 7px;
   background: #fff; outline: none;
 }
+.searchbox .btn { flex: none; }
 .searchbox input[type="search"]:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(31,111,235,.12); }
 
 .viewswitch { gap: 2px; }
@@ -231,14 +292,6 @@ button { font: inherit; }
 }
 .thumb-wrap.active .thumb { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(31,111,235,.16); }
 .thumb-wrap.active .num { color: var(--primary); font-weight: 600; }
-.side-foot {
-  padding: 8px 10px; border-top: 1px solid var(--line);
-  display: flex; gap: 6px; flex: none; flex-wrap: wrap;
-}
-.side-foot .btn { flex: 1; }
-/* 文档级的批量操作放第二行，顶栏已经挤不下（1440 宽再塞一个按钮就会把 OCR 开关顶出去） */
-.side-foot #btn-split { flex: 1 0 100%; }
-
 /* ---- 画布：单页 / 连续纵向 / 横向三种浏览方式 */
 .stage-wrap {
   overflow: auto; background: #eceff3;

@@ -1194,6 +1194,20 @@ async function main() {
     `OCR 行 ${ocrStale.ocrTag}｜${ocrStale.toast}`);
   check('改完内容后按钮变成「刷新识别」', /刷新识别/.test(String(ocrStale.btn)), String(ocrStale.btn));
   check('顶栏开关同步提示「待刷新」', /待刷新/.test(String(ocrStale.top)), String(ocrStale.top));
+
+  // 菜单里的同一个开关也要跟着走：顶栏胶囊是状态，菜单项是入口
+  const ocrMenuItem = await ev(`(async () => {
+    document.querySelector('.menu[data-menu="feat"] .menu-btn').click();
+    await new Promise((r) => setTimeout(r, 160));
+    const mi = document.querySelector('#btn-ocr-menu');
+    const txt = mi ? mi.textContent.trim().replace(/\\s+/g, ' ') : '';
+    const active = !!mi && mi.classList.contains('active');
+    document.querySelector('#stage-wrap').click();
+    await new Promise((r) => setTimeout(r, 80));
+    return { txt, active, closed: !document.querySelector('.menu.open') };
+  })()`);
+  check('功能菜单里的 OCR 项同步显示「待刷新」',
+    ocrMenuItem.active && /待刷新/.test(ocrMenuItem.txt) && ocrMenuItem.closed, ocrMenuItem.txt);
   check('对象面板给出「刷新识别 / 收起」提示', ocrStale.tip && /刷新识别/.test(ocrStale.tipText),
     ocrStale.tipText.slice(0, 40));
 
@@ -1404,23 +1418,93 @@ async function main() {
     `k 极差 ${race.spread != null ? race.spread.toFixed(4) : 'n/a'}`);
   await shot('cross-device');
 
+  /* ---------------------------------------------------------------- 菜单栏 */
+  console.log('\n== 菜单栏 ==');
+  const menuBtns = await ev(`[...document.querySelectorAll('.menu-btn')].map((b) => b.textContent.trim())`);
+  check('顶栏是「文件 / 功能」两个菜单', menuBtns.join(',') === '文件,功能', menuBtns.join(' / '));
+
+  const fileMenu = await ev(`(async () => {
+    const box = document.querySelector('.menu[data-menu="file"]');
+    box.querySelector('.menu-btn').click();
+    await new Promise((r) => setTimeout(r, 160));
+    const pop = box.querySelector('.menu-pop');
+    const r = pop.getBoundingClientRect();
+    return {
+      open: box.classList.contains('open'),
+      expanded: box.querySelector('.menu-btn').getAttribute('aria-expanded'),
+      left: Math.round(r.left), right: Math.round(r.right),
+      top: Math.round(r.top), bottom: Math.round(r.bottom),
+      vw: innerWidth, vh: innerHeight,
+      items: [...pop.querySelectorAll('.mi')].map((b) => b.textContent.trim().replace(/\\s+/g, ' ')),
+    };
+  })()`);
+  check('「文件」菜单能弹出且落在顶栏下方', fileMenu.open && fileMenu.expanded === 'true'
+    && fileMenu.top >= 50 && fileMenu.bottom <= fileMenu.vh,
+    `x=${fileMenu.left} y=${fileMenu.top} 高 ${fileMenu.bottom - fileMenu.top}`);
+  check('「文件」里是新建 / 打开 / 保存 / 另存为 / 插入 / 撤销',
+    ['新建', '打开', '保存', '另存为', '插入', '撤销'].every((k) => fileMenu.items.some((t) => t.includes(k))),
+    fileMenu.items.join('｜'));
+  check('菜单没有被右边缘裁掉', fileMenu.right <= fileMenu.vw, `${fileMenu.right} / ${fileMenu.vw}`);
+  await shot('menu-file');
+
+  const featMenu = await ev(`(async () => {
+    const b = document.querySelector('.menu[data-menu="feat"] .menu-btn');
+    // 已有菜单开着时划过另一个，应当直接切过去
+    b.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 150));
+    const box = document.querySelector('.menu[data-menu="feat"]');
+    return {
+      open: box.classList.contains('open'),
+      fileClosed: !document.querySelector('.menu[data-menu="file"]').classList.contains('open'),
+      items: [...box.querySelectorAll('.mi')].map((x) => x.textContent.trim().replace(/\\s+/g, ' ')),
+    };
+  })()`);
+  check('菜单开着时划到另一个直接切换', featMenu.open && featMenu.fileClosed, `${featMenu.items.length} 项`);
+  check('「功能」里有分割导出 / OCR / 页面 / 快捷键',
+    ['分割导出', 'OCR', '添加一页', '删除本页', '快捷键'].every((k) => featMenu.items.some((t) => t.includes(k))),
+    featMenu.items.join('｜'));
+  await shot('menu-feat');
+
+  const menuDismiss = await ev(`(async () => {
+    document.querySelector('#stage-wrap').click();
+    await new Promise((r) => setTimeout(r, 120));
+    const byOutside = !document.querySelector('.menu.open');
+    document.querySelector('.menu[data-menu="feat"] .menu-btn').click();
+    await new Promise((r) => setTimeout(r, 100));
+    const pop = document.querySelector('.menu[data-menu="feat"] .menu-pop').getBoundingClientRect();
+    const right = Math.round(pop.right), vw = innerWidth;
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await new Promise((r) => setTimeout(r, 100));
+    return { byOutside, byEsc: !document.querySelector('.menu.open'), right, vw };
+  })()`);
+  check('点空白处收起菜单', menuDismiss.byOutside);
+  check('Esc 收起菜单', menuDismiss.byEsc);
+  check('菜单在视口内不越界', menuDismiss.right <= menuDismiss.vw, `${menuDismiss.right} / ${menuDismiss.vw}`);
+
   /* ---------------------------------------------------------------- 批量分割 */
   console.log('\n== 批量分割 ==');
   const splitDir = join(process.cwd(), 'tmp', 'uitest_split');
   // 上一轮的产物必须清掉：目标已存在时后端会整批拒绝（这是对的，但会让测试假失败）
   rmSync(splitDir, { recursive: true, force: true });
+  // 入口在「功能」菜单里，先把菜单打开再量
+  await ev(`document.querySelector('.menu[data-menu="feat"] .menu-btn').click()`);
+  await sleep(180);
   const spEntry = await ev(`(() => {
     const b = document.querySelector('#btn-split');
     if (!b) return null;
     const r = b.getBoundingClientRect();
-    return { w: Math.round(r.width), h: Math.round(r.height), text: b.textContent.trim(),
+    return { w: Math.round(r.width), h: Math.round(r.height),
+             text: b.textContent.trim().replace(/\\s+/g, ' '),
              inView: r.bottom <= innerHeight + 1 && r.left >= 0 && r.right <= innerWidth };
   })()`);
-  check('侧栏有「分割导出」入口且可见', !!spEntry && spEntry.w > 60 && spEntry.h >= 20 && spEntry.inView,
-    spEntry ? `${spEntry.w}×${spEntry.h} 「${spEntry.text}」` : '找不到按钮');
+  check('「功能」菜单里有「分割导出」入口且可见',
+    !!spEntry && spEntry.w > 150 && spEntry.h >= 28 && spEntry.inView,
+    spEntry ? `${spEntry.w}×${spEntry.h} 「${spEntry.text.slice(0, 26)}」` : '找不到按钮');
 
   await ev(`document.querySelector('#btn-split').click()`);
   await sleep(900);
+  const menuAutoClosed = await ev(`!document.querySelector('.menu.open')`);
+  check('点了菜单项后菜单自动收起', menuAutoClosed);
   const sp1 = await ev(`(() => ({
     shown: document.querySelector('#modal').classList.contains('show'),
     title: document.querySelector('#modal-title').textContent,

@@ -694,6 +694,13 @@
             ? '这一页是扫描件，没有文字层：点一下识别本页文字（约 1~3 秒）'
             : '这一页本身就有文字层；如需校对图文是否一致，点一下可额外识别一次');
     }
+    // 「功能」菜单里同一开关：菜单项是入口，顶栏胶囊是状态 —— 两处一起走
+    const mi = $('#btn-ocr-menu');
+    if (mi) {
+      mi.classList.toggle('active', on);
+      const state = mi.querySelector('.mi-state');
+      if (state) state.textContent = on ? (stale ? '待刷新' : '已开启') : '关闭';
+    }
   }
 
   /* 关掉这一页的 OCR 显示（只影响显示，识别结果仍在后端缓存里） */
@@ -2044,6 +2051,121 @@
     });
   }
 
+  /* ------------------------------------------------------------------ 菜单栏 */
+  /* 顶栏两个下拉：文件（新建/打开/保存/另存为/插入/撤销）、
+   * 功能（分割导出/OCR/文本块/页面/快捷键）。
+   *
+   * 弹出层用 position:fixed 而不是 absolute —— 顶栏为了窄屏横滚设了
+   * overflow-x:auto，绝对定位的子元素会被裁掉，菜单会"点开却看不见"。
+   * 坐标在打开的那一刻量一次；页面一滚动就收起，免得菜单飘在原地。 */
+  (function setupMenubar() {
+    const bar = $('#menubar');
+    if (!bar) return;
+    const menus = Array.from(bar.querySelectorAll('.menu'));
+    let openIdx = -1;
+
+    function close(refocus) {
+      const was = openIdx;
+      menus.forEach((m) => {
+        m.classList.remove('open');
+        const b = m.querySelector('.menu-btn');
+        if (b) b.setAttribute('aria-expanded', 'false');
+      });
+      openIdx = -1;
+      if (refocus && was >= 0) {
+        const b = menus[was].querySelector('.menu-btn');
+        if (b) b.focus();
+      }
+    }
+
+    function place(m) {
+      const btn = m.querySelector('.menu-btn');
+      const pop = m.querySelector('.menu-pop');
+      if (!btn || !pop) return;
+      const r = btn.getBoundingClientRect();
+      // 顶栏下沿比按钮下沿更低（按钮在 50px 里居中只有 30px 高），
+      // 取两者较大值，菜单才是"吊在顶栏外面"而不是压住下边框
+      const barEl = bar.closest('.topbar') || bar;
+      const barBottom = barEl.getBoundingClientRect().bottom;
+      // 先归零再量：上一轮的位置可能把宽度撑到视口外
+      pop.style.left = '0px';
+      pop.style.top = '0px';
+      const w = pop.offsetWidth || 238;
+      const left = Math.max(8, Math.min(Math.round(r.left), innerWidth - w - 8));
+      pop.style.left = left + 'px';
+      pop.style.top = Math.round(Math.max(r.bottom + 6, barBottom + 4)) + 'px';
+    }
+
+    function open(i) {
+      menus.forEach((m, k) => {
+        const on = k === i;
+        m.classList.toggle('open', on);
+        const b = m.querySelector('.menu-btn');
+        if (b) b.setAttribute('aria-expanded', on ? 'true' : 'false');
+      });
+      openIdx = i;
+      place(menus[i]);
+    }
+
+    menus.forEach((m, i) => {
+      const btn = m.querySelector('.menu-btn');
+      if (!btn) return;
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (openIdx === i) close();
+        else open(i);
+      });
+      // 已有菜单开着时，划过另一个直接切过去（桌面软件的通常手感）
+      btn.addEventListener('mouseenter', () => {
+        if (openIdx >= 0 && openIdx !== i) open(i);
+      });
+    });
+
+    /* 点菜单项：先让元素自己的 onclick 跑完（那些是 btn-* 的既有绑定），
+       冒泡到 menubar 这里再收起。不能用 onclick= 覆盖，会把原动作顶掉。 */
+    bar.addEventListener('click', (e) => {
+      if (e.target.closest('.mi')) close();
+    });
+
+    document.addEventListener('click', (e) => {
+      if (openIdx >= 0 && !bar.contains(e.target)) close();
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (openIdx < 0) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close(true);
+        return;
+      }
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const items = Array.from(menus[openIdx].querySelectorAll('.mi'));
+        if (!items.length) return;
+        const at = items.indexOf(document.activeElement);
+        const step = e.key === 'ArrowDown' ? 1 : -1;
+        const next = at < 0
+          ? (step > 0 ? 0 : items.length - 1)
+          : (at + step + items.length) % items.length;
+        items[next].focus();
+      }
+    });
+
+    window.addEventListener('resize', () => { if (openIdx >= 0) close(); });
+    window.addEventListener('blur', () => { if (openIdx >= 0) close(); });
+    const stage = $('#stage-wrap');
+    if (stage) stage.addEventListener('scroll', () => { if (openIdx >= 0) close(); }, { passive: true });
+    // 顶栏左段横滚时菜单位置就不对了（fixed 是按视口算的）
+    const tbLeft = $('.tb-left');
+    if (tbLeft) tbLeft.addEventListener('scroll', () => { if (openIdx >= 0) close(); }, { passive: true });
+  })();
+
+  /* 菜单里新增的两个入口 */
+  $('#btn-saveas').onclick = () => saveAs();
+  const ocrMenuBtn = $('#btn-ocr-menu');
+  if (ocrMenuBtn) ocrMenuBtn.onclick = () => doOcrPage();
+
   $('#btn-open').onclick = () => openFileDialog();
 
   async function openFileDialog() {
@@ -2590,15 +2712,21 @@
   }
 
   async function saveAs() {
-    const def = await defaultSavePath();
+    if (!S.doc) return toast('先打开或新建一个文档', 'err');
+    const isAs = !!S.path;
+    let def = await defaultSavePath();
+    // 另存为默认落在原名旁边加「-副本」，不用再从"未命名"里找
+    if (isAs) def = S.path.replace(/\.pdf$/i, '') + '-副本.pdf';
     const r = await dialog({
-      title: '保存新文档',
+      title: isAs ? '另存为' : '保存新文档',
       okText: '保存到该路径',
       html: `
         <div class="field"><label>保存路径（可修改）</label>
           <input type="text" data-field="path" id="s-path" value="${esc(def)}" /></div>
         <div class="browser" id="s-browser"><div class="path">加载中…</div></div>
-        <div class="hint">这是一份<b>新建文档</b>，还没有保存到磁盘。确认上面的完整路径后点「保存到该路径」。</div>`,
+        <div class="hint">${isAs
+          ? '会另存一份到上面这个路径，之后 <b>Ctrl+S</b> 就存到这里；原文件不动。'
+          : '这是一份<b>新建文档</b>，还没有保存到磁盘。确认上面的完整路径后点「保存到该路径」。'}</div>`,
       onMount: async (el) => {
         const box = el.querySelector('#s-browser');
         const input = el.querySelector('#s-path');
@@ -2930,6 +3058,8 @@
     {
       title: '文件',
       items: [
+        ['新建空白文档', ['Ctrl', 'N']],
+        ['打开 PDF', ['Ctrl', 'O']],
         ['保存', ['Ctrl', 'S']],
         ['撤销', ['Ctrl', 'Z']],
       ],
@@ -3004,10 +3134,16 @@
 
   /* ------------------------------------------------------------------ 快捷键 */
   document.addEventListener('keydown', (e) => {
-    if (e.target.matches('input, textarea, select')) return;
+    // 合成事件（测试脚本、扩展）的 target 可能是 document，没有 matches
+    const tgt = e.target;
+    if (tgt && tgt.matches && tgt.matches('input, textarea, select')) return;
+    // 菜单开着时，除 Ctrl/Cmd 组合键外都交给菜单（Esc 收起、上下键选项）
+    if (document.querySelector('.menu.open') && !(e.ctrlKey || e.metaKey)) return;
     const k = e.key.toLowerCase();
     if (e.ctrlKey || e.metaKey) {
       if (k === 's') { e.preventDefault(); doSave(); return; }
+      if (k === 'n') { e.preventDefault(); newDocument(); return; }
+      if (k === 'o') { e.preventDefault(); openFileDialog(); return; }
       if (k === 'z') { e.preventDefault(); $('#btn-undo').click(); return; }
       // 没选中对象时不拦：留给浏览器默认的复制（选中页面文字等）
       if (k === 'c' && S.sel) { e.preventDefault(); copySelection(); return; }
