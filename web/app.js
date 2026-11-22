@@ -3089,6 +3089,7 @@
       items: [
         ['上一页 / 下一页', ['PgUp', 'PgDn']],
         ['放大 / 缩小', ['Ctrl', '滚轮']],
+        ['显示 / 收起对象面板', ['Ctrl', 'B']],
         ['打开 / 收起本栏', ['?']],
       ],
     },
@@ -3132,6 +3133,48 @@
   $('#btn-keys').onclick = () => setKeys(!keysOpen());
   $('#keys-close').onclick = () => setKeys(false);
 
+  /* ------------------------------------------------------------------ 右侧面板开合 */
+  function inspOpen() {
+    const l = $('.layout');
+    return !!l && !l.classList.contains('insp-off');
+  }
+
+  function setInspector(open, persist = true) {
+    const l = $('.layout');
+    const panel = $('#inspector');
+    if (!l || !panel) return;
+    const off = !open;
+    l.classList.toggle('insp-off', off);
+    panel.setAttribute('aria-hidden', off ? 'true' : 'false');
+    // 三处入口保持同一状态：顶栏按钮、功能菜单、面板自己的收起按钮
+    const top = $('#btn-inspector');
+    if (top) {
+      top.classList.toggle('off', off);
+      top.classList.toggle('active', !off);
+      top.setAttribute('aria-expanded', off ? 'false' : 'true');
+      top.title = off ? '展开右侧面板 (Ctrl+B)' : '收起右侧面板 (Ctrl+B)';
+    }
+    const mi = $('#btn-inspector-menu');
+    if (mi) {
+      mi.classList.toggle('active', !off);
+      mi.title = off ? '当前已收起；点一下展开' : '点一下收起，把宽度让给页面';
+    }
+    // 画布宽度变了：canvas 位图是 drawOverlay 按内容尺寸重设的，
+    // 只靠 CSS 改宽度会被拉伸，选框与笔迹会错位（和展开快捷键侧栏同一处理）
+    requestAnimationFrame(() => {
+      baseRect = null;
+      drawOverlay();
+      setTimeout(drawOverlay, 220);
+    });
+    if (persist) {
+      try { localStorage.setItem('pdfx.insp', off ? '0' : '1'); } catch (e) { /* 隐私模式 */ }
+    }
+  }
+
+  $('#btn-inspector').onclick = () => setInspector(!inspOpen());
+  $('#btn-inspector-close').onclick = () => setInspector(false);
+  $('#btn-inspector-menu').onclick = () => setInspector(!inspOpen());
+
   /* ------------------------------------------------------------------ 快捷键 */
   document.addEventListener('keydown', (e) => {
     // 合成事件（测试脚本、扩展）的 target 可能是 document，没有 matches
@@ -3144,6 +3187,7 @@
       if (k === 's') { e.preventDefault(); doSave(); return; }
       if (k === 'n') { e.preventDefault(); newDocument(); return; }
       if (k === 'o') { e.preventDefault(); openFileDialog(); return; }
+      if (k === 'b') { e.preventDefault(); setInspector(!inspOpen()); return; }
       if (k === 'z') { e.preventDefault(); $('#btn-undo').click(); return; }
       // 没选中对象时不拦：留给浏览器默认的复制（选中页面文字等）
       if (k === 'c' && S.sel) { e.preventDefault(); copySelection(); return; }
@@ -3207,6 +3251,9 @@
     checkServerCaps();
     // 上次开着就还开着：这是"随时想看"的辅助面板，不该每次刷新都重开一遍
     try { if (localStorage.getItem('pdfx.keys') === '1') setKeys(true); } catch (e) { /* 隐私模式 */ }
+    // 右侧面板同理：只有明确收起过才收起，第一次用默认展开（否则新用户会以为没有属性面板）
+    // 无条件走一遍 setInspector，是为了把顶栏按钮 / 菜单项的勾选态和真实状态对齐
+    try { setInspector(localStorage.getItem('pdfx.insp') !== '0', false); } catch (e) { /* 隐私模式 */ }
     try {
       const info = await api('/api/doc');
       await loadInfo(info);

@@ -220,6 +220,13 @@ async function main() {
     if (n > 0) break;
     await sleep(200);
   }
+  // 右侧面板的状态记在 localStorage 里。上一次跑测试如果停在收起态，
+  // 后面所有「对象/属性面板」的断言都会莫名失败 —— 开测先恢复成展开并清掉这个键
+  if (await ev(`document.querySelector('.layout').classList.contains('insp-off')`)) {
+    await ev(`document.querySelector('#btn-inspector').click()`);
+    await sleep(320);
+  }
+  await ev(`localStorage.removeItem('pdfx.insp')`);
 
   console.log(`\n== 初始加载 (${BASE}) ==`);
   check('页面无 JS 异常', errors.length === 0, errors.slice(0, 3).join(' | '));
@@ -1480,6 +1487,106 @@ async function main() {
   check('点空白处收起菜单', menuDismiss.byOutside);
   check('Esc 收起菜单', menuDismiss.byEsc);
   check('菜单在视口内不越界', menuDismiss.right <= menuDismiss.vw, `${menuDismiss.right} / ${menuDismiss.vw}`);
+
+  /* ---------------------------------------------------------------- 右侧面板开合 */
+  console.log('\n== 右侧面板开合 ==');
+  const inspGeo = () => ev(`(() => {
+    const l = document.querySelector('.layout');
+    const insp = document.querySelector('#inspector');
+    const stage = document.querySelector('#stage-wrap');
+    const top = document.querySelector('#btn-inspector');
+    const r = insp.getBoundingClientRect();
+    const s = stage.getBoundingClientRect();
+    const t = top.getBoundingClientRect();
+    return {
+      inspW: Math.round(r.width), stageW: Math.round(s.width),
+      off: l.classList.contains('insp-off'),
+      topOn: top.classList.contains('active'), topOff: top.classList.contains('off'),
+      topIn: t.left >= 0 && t.right <= innerWidth && t.top >= 0 && t.bottom <= innerHeight,
+      aria: insp.getAttribute('aria-hidden'),
+      tabsVisible: document.querySelectorAll('#inspector .tab').length === 3
+        && document.querySelector('#inspector .tab').getBoundingClientRect().height > 10,
+      stored: (() => { try { return localStorage.getItem('pdfx.insp'); } catch (e) { return 'n/a'; } })(),
+    };
+  })()`);
+
+  const insp0 = await inspGeo();
+  check('右侧面板默认展开、三个标签页可见',
+    insp0.inspW >= 290 && !insp0.off && insp0.tabsVisible && insp0.topOn,
+    `宽 ${insp0.inspW}，按钮高亮 ${insp0.topOn}`);
+  check('顶栏的面板开关在可视区内', insp0.topIn);
+  await shot('insp-open');
+
+  // 1) 顶栏按钮收起
+  await ev(`document.querySelector('#btn-inspector').click()`);
+  await sleep(560);
+  const insp1 = await inspGeo();
+  check('点顶栏按钮收起：面板宽度归零',
+    insp1.off && insp1.inspW <= 2 && insp1.aria === 'true',
+    `${insp0.inspW} → ${insp1.inspW}`);
+  check('收起后画布让出约 306px', insp1.stageW - insp0.stageW >= 290,
+    `${insp0.stageW} → ${insp1.stageW}（+${insp1.stageW - insp0.stageW}）`);
+  check('收起后顶栏按钮变成「可展开」的形态', insp1.topOff && !insp1.topOn);
+  check('收起状态写进 localStorage', insp1.stored === '0', String(insp1.stored));
+  await shot('insp-closed');
+
+  // 2) 面板自己的收起按钮
+  await ev(`document.querySelector('#btn-inspector').click()`);
+  await sleep(460);
+  await ev(`document.querySelector('#btn-inspector-close').click()`);
+  await sleep(520);
+  const insp2 = await inspGeo();
+  check('面板内「‹」也能收起', insp2.off && insp2.inspW <= 2, `宽 ${insp2.inspW}`);
+
+  // 3) Ctrl+B
+  await ev(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', ctrlKey: true, bubbles: true }))`);
+  await sleep(520);
+  const insp3 = await inspGeo();
+  check('Ctrl+B 展开、再按收起',
+    !insp3.off && insp3.inspW >= 290 && insp3.stored === '1',
+    `宽 ${insp3.inspW}`);
+  await ev(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', ctrlKey: true, bubbles: true }))`);
+  await sleep(520);
+  const insp4 = await inspGeo();
+  check('再按 Ctrl+B 收起', insp4.off && insp4.inspW <= 2);
+
+  // 4) 功能菜单里的开关：勾选态跟着真实状态走，点一下能展开
+  await ev(`document.querySelector('.menu[data-menu="feat"] .menu-btn').click()`);
+  await sleep(200);
+  const miOff = await ev(`(() => {
+    const mi = document.querySelector('#btn-inspector-menu');
+    const r = mi.getBoundingClientRect();
+    return { on: mi.classList.contains('active'), w: Math.round(r.width),
+             text: mi.textContent.trim().replace(/\\s+/g, ' '),
+             inView: r.bottom <= innerHeight && r.right <= innerWidth };
+  })()`);
+  check('菜单里有「对象 / 属性面板」项且收起时未勾选',
+    miOff.w > 150 && miOff.inView && !miOff.on, `「${miOff.text}」`);
+  await ev(`document.querySelector('#btn-inspector-menu').click()`);
+  await sleep(560);
+  const insp5 = await inspGeo();
+  const menuClosed2 = await ev(`!document.querySelector('.menu.open')`);
+  check('点菜单项展开面板并自动收起菜单',
+    !insp5.off && insp5.inspW >= 290 && menuClosed2, `宽 ${insp5.inspW}`);
+
+  // 5) 展开状态下菜单项应当是勾选的
+  await ev(`document.querySelector('.menu[data-menu="feat"] .menu-btn').click()`);
+  await sleep(200);
+  const miOn = await ev(`document.querySelector('#btn-inspector-menu').classList.contains('active')`);
+  await ev(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+  await sleep(200);
+  check('展开时菜单项打勾', miOn === true);
+
+  // 6) 收起/展开不能把画布上的东西弄丢：页码、页面数量不变
+  const afterToggle = await ev(`(() => ({
+    pages: document.querySelectorAll('#pages .pbox').length,
+    cur: document.querySelector('#page-now') ? document.querySelector('#page-now').textContent : '',
+  }))()`);
+  check('来回开合不影响页面与当前页', afterToggle.pages >= 1, `${afterToggle.pages} 页`);
+  // 收尾：留在展开态，免得影响后面的面板交互测试
+  await ev(`document.querySelector('.layout').classList.contains('insp-off')
+    && document.querySelector('#btn-inspector').click()`);
+  await sleep(400);
 
   /* ---------------------------------------------------------------- 批量分割 */
   console.log('\n== 批量分割 ==');

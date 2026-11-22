@@ -188,12 +188,20 @@ button { font: inherit; }
 .layout {
   flex: 1 1 auto; min-height: 0;
   display: grid;
-  grid-template-columns: 200px 1fr 306px 0;
+  /* 列宽用变量：三个侧栏都靠改变量开合，免得 class 组合爆炸（insp-off + keys-open …） */
+  --w-side: 200px;
+  --w-insp: 306px;
+  --w-keys: 0px;
+  grid-template-columns: var(--w-side) 1fr var(--w-insp) var(--w-keys);
   transition: grid-template-columns .18s ease;
 }
 /* 快捷键侧栏展开：多出第 4 列。用网格列宽做动画，内容区会跟着变窄，
    面板不会盖住画布 —— 一边看一边按才顺手。 */
-.layout.keys-open { grid-template-columns: 200px 1fr 306px 288px; }
+.layout.keys-open { --w-keys: 288px; }
+/* 收起右侧面板：画布直接变宽 306px（不做浮层遮挡，页面还是完整的宽） */
+.layout.insp-off { --w-insp: 0px; }
+/* 列宽归零后那条 1px 边框会单独留在画布右边缘，收起时一并去掉 */
+.layout.insp-off .inspector { border-left-width: 0; }
 
 /* ---- 快捷键侧栏（可隐藏） */
 .keys-panel { background: var(--panel); min-width: 0; overflow: hidden; display: flex; min-height: 0; }
@@ -226,6 +234,9 @@ button { font: inherit; }
 .keys-foot { flex: none; padding: 8px 12px; border-top: 1px solid var(--line); font-size: 11px; color: var(--muted); }
 #btn-keys svg { width: 16px; height: 16px; }
 #btn-keys.active { background: var(--primary-weak); border-color: #c7dbfb; color: var(--primary); }
+/* 右侧面板开关：收起时把图标镜像一下，竖线跑到左边 = 面板在屏幕右侧且已收起 */
+#btn-inspector svg { width: 16px; height: 16px; display: block; margin: 0 auto; }
+#btn-inspector.off svg { transform: scaleX(-1); }
 
 /* ---- 左侧：文档栏 + 页面缩略图 */
 .sidebar {
@@ -344,8 +355,12 @@ button { font: inherit; }
 .inspector {
   background: var(--panel); border-left: 1px solid var(--line);
   display: flex; flex-direction: column; min-height: 0;
+  /* 列宽收到 0 时把内容切掉，不然面板会溢到画布上面挡操作 */
+  min-width: 0; overflow: hidden;
 }
-.tabs { display: flex; border-bottom: 1px solid var(--line); }
+.tabs { display: flex; border-bottom: 1px solid var(--line); flex: none; }
+.tab-collapse { flex: none; width: 28px; height: 26px; align-self: center; margin: 0 4px; }
+.tab-collapse svg { width: 15px; height: 15px; display: block; margin: 0 auto; }
 .tab {
   flex: 1; height: 38px; border: 0; background: transparent;
   color: var(--muted); cursor: pointer; font-size: 12px;

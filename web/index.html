@@ -45,6 +45,9 @@
         <button class="mi" role="menuitem" id="btn-showtext">
           <span class="mi-t">显示文本块边界</span><span class="mi-mark"></span>
         </button>
+        <button class="mi" role="menuitem" id="btn-inspector-menu">
+          <span class="mi-t">对象 / 属性面板</span><kbd>Ctrl B</kbd><span class="mi-mark"></span>
+        </button>
         <div class="mi-sep"></div>
         <button class="mi" role="menuitem" id="btn-add-page"><span class="mi-t">添加一页</span><span class="mi-mark"></span></button>
         <button class="mi danger" role="menuitem" id="btn-del-page"><span class="mi-t">删除本页</span><span class="mi-mark"></span></button>
@@ -103,6 +106,9 @@
     <span id="zoom-label">100%</span>
     <button class="btn icon" id="zoom-in">+</button>
   </div>
+  <button class="btn icon" id="btn-inspector" title="收起 / 展开右侧面板 (Ctrl+B)" aria-expanded="true">
+    <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M15 4v16" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
+  </button>
   <button class="btn ocr-toggle" id="btn-ocr-top" title="扫描件没有文字层：点一下识别本页文字（约 1~3 秒）">本页 OCR 关</button>
   <div class="ocr-badge" id="ocr-badge" title="OCR 引擎状态">OCR</div>
   </div>
@@ -151,6 +157,9 @@
       <button class="tab active" data-tab="objects">对象</button>
       <button class="tab" data-tab="props">属性</button>
       <button class="tab" data-tab="results">结果</button>
+      <button class="btn icon ghost tab-collapse" id="btn-inspector-close" title="收起面板 (Ctrl+B)">
+        <svg viewBox="0 0 24 24"><path d="M14 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
     </div>
 
     <div class="tabpane active" id="pane-objects">
