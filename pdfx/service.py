@@ -242,6 +242,53 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _drive_roots() -> list[dict[str, str]]:
+    """可切换的根目录：Windows 是盘符，其它平台就是 /。
+
+    只有「↑ 上级目录」是不够的：Windows 上 ``C:\\`` 的 parent 还是 ``C:\\``，
+    走到根就卡住，D 盘上的文件必须先拷到 C 盘才打得开。
+    """
+    if os.name != "nt":
+        return [{"name": "/", "path": "/"}]
+    paths: list[str] = []
+    try:  # Python 3.12+
+        paths = list(os.listdrives())  # type: ignore[attr-defined]
+    except AttributeError:
+        for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            root = f"{ch}:\\"
+            try:
+                if os.path.exists(root):
+                    paths.append(root)
+            except OSError:
+                continue
+    out: list[dict[str, str]] = []
+    for root in paths:
+        name = root.rstrip("\\/")
+        if name:
+            out.append({"name": name, "path": str(Path(root))})
+    return out
+
+
+def _nearest_dir(p: Path, limit: int = 12) -> "Path | None":
+    """往上找最近一个真实存在的目录。
+
+    分割弹窗的默认输出目录（``<书名>_split``）在导出前并不存在，
+    直接拿它当浏览起点会让用户看到一屏错误，连盘符都没有。
+    """
+    cur = p
+    for _ in range(limit):
+        parent = cur.parent
+        if str(parent) == str(cur):
+            return None
+        try:
+            if parent.exists() and parent.is_dir():
+                return parent
+        except OSError:
+            pass
+        cur = parent
+    return None
+
+
 def _split_source(b: dict[str, Any]) -> tuple[Any, int, str, list[dict[str, Any]]]:
     """分割要用的源 → (源, 页数, 用于命名/默认目录的路径, 目录条目)。
 
@@ -842,26 +889,55 @@ def create_app(initial: str | None = None) -> Flask:
     @app.get("/api/browse")
     @_wrap
     def api_browse():
-        p = Path(request.args.get("dir") or Path.home())
+        raw = request.args.get("dir")
+        p = Path(raw).expanduser() if raw else Path.home()
+        try:
+            p = p.resolve()
+        except OSError:
+            pass
+        requested = str(p)
         if not p.exists() or not p.is_dir():
-            raise PdfxError(f"目录不存在: {p}", "not_found")
+            # 前端浏览框带着 fallback=1 来：目录还没建（比如分割的默认输出目录）就退到上级，
+            # 而不是甩一屏 red 错误。直接调接口的脚本仍然拿到 404，语义不偷偷变。
+            if request.args.get("fallback") in ("1", "true", "yes"):
+                near = _nearest_dir(p)
+                if near is not None:
+                    p = near
+            if not p.exists() or not p.is_dir():
+                raise PdfxError(f"目录不存在: {p}", "not_found")
         items = []
         try:
             for child in sorted(p.iterdir(), key=lambda c: (not c.is_dir(), c.name.lower()))[:400]:
                 if child.name.startswith("."):
                     continue
+                try:
+                    size = child.stat().st_size if child.is_file() else 0
+                    is_dir = child.is_dir()
+                except OSError:
+                    size, is_dir = 0, False
                 items.append(
                     {
                         "name": child.name,
                         "path": str(child),
-                        "dir": child.is_dir(),
-                        "size": child.stat().st_size if child.is_file() else 0,
+                        "dir": is_dir,
+                        "size": size,
                         "pdf": child.suffix.lower() == ".pdf",
                     }
                 )
         except PermissionError:
             raise PdfxError("没有访问权限", "permission_denied")
-        return {"dir": str(p), "parent": str(p.parent), "items": items}
+        parent = str(p.parent)
+        # 已经是盘符根（C:\ 的 parent 还是 C:\）：再往上就是"我的电脑"，
+        # 前端据此隐藏「上级目录」，改用 roots 里的盘符条换盘。
+        if parent == str(p):
+            parent = ""
+        return {
+            "dir": str(p),
+            "requested": requested,
+            "parent": parent,
+            "roots": _drive_roots(),
+            "items": items,
+        }
 
     # ------------------------------------------------------------------ 启动
     if initial:

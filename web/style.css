@@ -563,6 +563,25 @@ button { font: inherit; }
 .browser .item:not(.isfile) { color: #374151; font-weight: 500; }
 .browser .item .sz { margin-left: auto; font-size: 11px; color: var(--muted); }
 
+/* 文件浏览里的盘符条：Windows 上 C: / D: / Q: …，点一下直接换盘。
+   不带 .browser 前缀 —— 分割弹窗用的是 .sp-browser，也要用同一套。 */
+.drives {
+  display: flex; flex-wrap: wrap; gap: 4px; padding: 6px 8px;
+  background: #fff; border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 2;
+}
+.drive {
+  height: 22px; padding: 0 9px; border: 1px solid var(--line-strong);
+  border-radius: 999px; background: #fff; color: var(--text);
+  font-size: 11.5px; line-height: 20px; cursor: pointer;
+}
+.drive:hover { border-color: #b8c0cc; background: #fafbfc; }
+.drive.on { color: var(--primary); border-color: #c7dbfb; background: var(--primary-weak); font-weight: 600; }
+/* 目录不存在、已回落到上级时的说明条 */
+.path.warn, .browser .path.warn, .sp-browser .path.warn {
+  color: #b26a00; background: #fff8ec; border-bottom-color: #f3dfb8;
+}
+
 /* ---- toast */
 .toast {
   /* 抬到浮动参数栏上方，避免提示把颜色/粗细控件盖住 */

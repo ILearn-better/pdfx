@@ -263,6 +263,14 @@ def main() -> int:
     ok("重开后笔迹状态已烘焙", d2.list_strokes(0)["count"] == 0)
     d2.close()
 
+    # 手输一个新目录（其它盘同理）：目录不存在也要能存下去，不能只认已有目录
+    deep = TMP / "新目录" / "更深一层" / "a.pdf"
+    d = fresh("samples/sample_text.pdf", "mkdir.pdf")
+    d.save(deep)
+    d.close()
+    ok("保存到还不存在的目录会自动建目录", deep.exists() and deep.stat().st_size > 1000,
+       str(deep))
+
     d = fresh("samples/sample_text.pdf", "undo.pdf")
     before = d.list_text(0)["count"]
     d.add_text(0, "临时内容", rect=[100, 300, 300, 320])

@@ -2009,6 +2009,110 @@
   };
 
   /* ------------------------------------------------------------------ 文件操作 */
+  /* 上次去过的目录。默认落在用户目录（C 盘）不够用 —— 教材常放在 D/E 盘，
+     记一下就能接着上次的位置翻，不用每次从 C 盘一路点下去。 */
+  function lastDir() {
+    try { return localStorage.getItem('pdfx.lastDir') || ''; } catch (e) { return ''; }
+  }
+  function setLastDir(dir) {
+    try { if (dir) localStorage.setItem('pdfx.lastDir', dir); } catch (e) { /* 隐私模式 */ }
+  }
+
+  /* 通用目录浏览器：盘符条 + 当前位置 + 上级 + 子目录（可选 PDF 文件）。
+     三处用到（打开 / 保存 / 分割输出目录）。以前各写一份，都是只有「↑ 上级目录」，
+     Windows 上到 C:\ 之后 parent 还是 C:\，换不到 D 盘 —— 只能先把文件拷到 C 盘。 */
+  async function mountBrowser(box, opts = {}) {
+    const { files = false, pickDir = null, onDir = null, onFile = null } = opts;
+    let roots = [];
+    async function nav(p) {
+      let r = null;
+      try {
+        const qs = ['fallback=1'];
+        if (p) qs.push('dir=' + encodeURIComponent(p));
+        r = await api('/api/browse?' + qs.join('&'));
+      } catch (e) {
+        // 真的进不去（权限不足、盘符被拔掉）：别把整个浏览器弄死，给条退路
+        box.innerHTML = '';
+        const bad = document.createElement('div');
+        bad.className = 'path warn';
+        bad.textContent = e.message;
+        box.appendChild(bad);
+        const back = document.createElement('div');
+        back.className = 'item';
+        back.textContent = '← 回到我的文档';
+        back.onclick = () => nav('');
+        box.appendChild(back);
+        return;
+      }
+      roots = (r.roots && r.roots.length) ? r.roots : roots;
+      setLastDir(r.dir);
+      if (onDir) onDir(r.dir);
+
+      box.innerHTML = '';
+      // 盘符条：只有一个根（macOS/Linux）时不显示，省得占一行
+      if (roots.length > 1) {
+        const bar = document.createElement('div');
+        bar.className = 'drives';
+        roots.forEach((rt) => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'drive' + (rt.path.toLowerCase() === r.dir.toLowerCase() ? ' on' : '');
+          b.textContent = rt.name;
+          b.title = rt.path;
+          b.onclick = () => nav(rt.path);
+          bar.appendChild(b);
+        });
+        box.appendChild(bar);
+      }
+
+      const head = document.createElement('div');
+      head.className = 'path';
+      head.textContent = r.dir;
+      box.appendChild(head);
+
+      // 目录还没建（分割的默认输出目录就是这种）：说明一下为什么不是刚才那个路径
+      // 比较前先归一（斜杠方向、末尾分隔符、大小写），否则 C:/a 与 C:\a 会被判成不同
+      const norm = (s) => String(s || '').replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
+      if (r.requested && norm(r.requested) !== norm(r.dir)) {
+        const tip = document.createElement('div');
+        tip.className = 'path warn';
+        tip.textContent = `${r.requested} 还不存在，已跳到上级目录`;
+        box.appendChild(tip);
+      }
+
+      // 到了盘符根就没有"上级"了（上一层是盘符条）
+      if (r.parent) {
+        const up = document.createElement('div');
+        up.className = 'item';
+        up.textContent = '↑ 上级目录';
+        up.onclick = () => nav(r.parent);
+        box.appendChild(up);
+      }
+
+      r.items.filter((it) => it.dir || (files && it.pdf)).forEach((it) => {
+        const row = document.createElement('div');
+        row.className = 'item' + (it.dir ? '' : ' isfile');
+        row.innerHTML = `<span>${it.dir ? '📁' : '📄'} ${esc(it.name)}</span>`
+          + (it.dir ? '' : `<span class="sz">${fmtSize(it.size)}</span>`);
+        row.onclick = () => {
+          if (it.dir) nav(it.path);
+          else if (onFile) onFile(it.path);
+        };
+        box.appendChild(row);
+      });
+
+      if (pickDir) {
+        const pick = document.createElement('div');
+        pick.className = 'item sp-pick-here';
+        pick.innerHTML = `<span>✓ ${esc(pickDir(r.dir))}</span>`;
+        pick.onclick = () => opts.onPickDir && opts.onPickDir(r.dir);
+        box.appendChild(pick);
+      }
+    }
+    await nav(opts.start || '');
+    return { nav };
+  }
+
   /* 通用文件浏览对话框，返回选中的 PDF 路径 */
   function browseDialog({ title, okText, startDir }) {
     const html = `<div class="field"><label>文件路径</label>
@@ -2020,33 +2124,11 @@
       html,
       okText,
       onMount: (el) => {
-        const box = el.querySelector('#browser');
-        async function nav(p) {
-          try {
-            const r = await api('/api/browse' + (p ? '?dir=' + encodeURIComponent(p) : ''));
-            box.innerHTML = `<div class="path">${esc(r.dir)}</div>`;
-            const up = document.createElement('div');
-            up.className = 'item';
-            up.textContent = '↑ 上级目录';
-            up.onclick = () => nav(r.parent);
-            box.appendChild(up);
-            r.items.forEach((it) => {
-              if (it.dir || it.pdf) {
-                const row = document.createElement('div');
-                row.className = 'item' + (it.pdf ? ' isfile' : '');
-                row.innerHTML = `<span>${it.dir ? '📁' : '📄'} ${esc(it.name)}</span><span class="sz">${it.dir ? '' : fmtSize(it.size)}</span>`;
-                row.onclick = () => {
-                  if (it.dir) nav(it.path);
-                  else el.querySelector('#f-path').value = it.path;
-                };
-                box.appendChild(row);
-              }
-            });
-          } catch (e) {
-            box.innerHTML = `<div class="path">${esc(e.message)}</div>`;
-          }
-        }
-        nav(startDir || '');
+        mountBrowser(el.querySelector('#browser'), {
+          start: startDir || '',
+          files: true,
+          onFile: (p) => { el.querySelector('#f-path').value = p; },
+        });
       },
     });
   }
@@ -2169,7 +2251,7 @@
   $('#btn-open').onclick = () => openFileDialog();
 
   async function openFileDialog() {
-    const r = await browseDialog({ title: '打开 PDF', okText: '打开' });
+    const r = await browseDialog({ title: '打开 PDF', okText: '打开', startDir: lastDir() });
     if (r && r.path) {
       try {
         const info = await api('/api/open', { json: { path: r.path } });
@@ -2192,7 +2274,7 @@
   /* ---- 插入另一个 PDF 的页面 ---- */
   $('#btn-insert-pdf').onclick = async () => {
     if (!S.doc) return toast('先打开或新建一个文档', 'err');
-    const picked = await browseDialog({ title: '插入 PDF —— 选择文件', okText: '下一步' });
+    const picked = await browseDialog({ title: '插入 PDF —— 选择文件', okText: '下一步', startDir: lastDir() });
     if (!picked || !picked.path) return;
     const ask = await dialog({
       title: '插入 PDF —— 选择页面',
@@ -2482,42 +2564,17 @@
           box.className = 'sp-browser';
           box.innerHTML = '<div class="path">加载中…</div>';
           outEl.parentElement.parentElement.appendChild(box);
-          const name = (p) => p.replace(/\\/g, '/').split('/').filter(Boolean).pop() || p;
-          (async () => {
-            let cur = outEl.value.trim();
-            if (!cur) cur = '';
-            async function nav(p) {
-              try {
-                const r = await api('/api/browse' + (p ? '?dir=' + encodeURIComponent(p) : ''));
-                box.innerHTML = `<div class="path">${esc(r.dir)}</div>`;
-                const up = document.createElement('div');
-                up.className = 'item';
-                up.textContent = '↑ 上级目录';
-                up.onclick = () => nav(r.parent);
-                box.appendChild(up);
-                r.items.filter((it) => it.dir).forEach((it) => {
-                  const row = document.createElement('div');
-                  row.className = 'item';
-                  row.innerHTML = `<span>📁 ${esc(it.name)}</span>`;
-                  row.onclick = () => nav(it.path);
-                  box.appendChild(row);
-                });
-                const pick = document.createElement('div');
-                pick.className = 'item sp-pick-here';
-                pick.innerHTML = `<span>✓ 用这个目录：${esc(name(r.dir))}</span>`;
-                pick.onclick = () => {
-                  outEl.value = r.dir;
-                  st.outTouched = true;
-                  box.remove();
-                  preview();
-                };
-                box.appendChild(pick);
-              } catch (e) {
-                box.innerHTML = `<div class="path">${esc(e.message)}</div>`;
-              }
-            }
-            nav(cur);
-          })();
+          const shortName = (p) => p.replace(/\\/g, '/').split('/').filter(Boolean).pop() || p;
+          mountBrowser(box, {
+            start: outEl.value.trim(),
+            pickDir: (dir) => `用这个目录：${shortName(dir)}`,
+            onPickDir: (dir) => {
+              outEl.value = dir;
+              st.outTouched = true;
+              box.remove();
+              preview();
+            },
+          });
         };
 
         /* 选另一份 PDF：走系统文件框上传到临时目录，不打开成新文档 */
@@ -2699,11 +2756,16 @@
 
   /* ---- 保存 ---- */
   async function defaultSavePath() {
-    let dir = '';
-    try {
-      const r = await api('/api/browse');
-      dir = r.dir || '';
-    } catch (e) { dir = ''; }
+    // 上次去过的目录优先 —— 但那个目录可能已经被删了，先用一次 browse 验证，
+    // 不行再退回用户目录，免得一打开保存框就是个不存在的路径
+    let dir = lastDir();
+    if (dir) {
+      try { dir = (await api('/api/browse?dir=' + encodeURIComponent(dir))).dir; }
+      catch (e) { dir = ''; }
+    }
+    if (!dir) {
+      try { dir = (await api('/api/browse')).dir || ''; } catch (e) { dir = ''; }
+    }
     const d = new Date();
     const pad = (n) => String(n).padStart(2, '0');
     const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
@@ -2730,33 +2792,16 @@
       onMount: async (el) => {
         const box = el.querySelector('#s-browser');
         const input = el.querySelector('#s-path');
-        let dir = '';
-        async function nav(p) {
-          try {
-            const rr = await api('/api/browse' + (p ? '?dir=' + encodeURIComponent(p) : ''));
-            dir = rr.dir;
+        mountBrowser(box, {
+          // 从路径框里已有的目录开始，别让浏览框显示 home 而输入框是别的盘
+          start: String(def).replace(/[\\/][^\\/]*$/, ''),
+          onDir: (dir) => {
             // 切目录时保留文件名，只换目录
             const name = baseName(input.value) || '未命名.pdf';
             const sep = dir.includes('\\') ? '\\' : '/';
             input.value = dir + sep + name;
-            box.innerHTML = `<div class="path">${esc(rr.dir)}</div>`;
-            const up = document.createElement('div');
-            up.className = 'item';
-            up.textContent = '↑ 上级目录';
-            up.onclick = () => nav(rr.parent);
-            box.appendChild(up);
-            rr.items.filter((it) => it.dir).forEach((it) => {
-              const row = document.createElement('div');
-              row.className = 'item';
-              row.innerHTML = `<span>📁 ${esc(it.name)}</span>`;
-              row.onclick = () => nav(it.path);
-              box.appendChild(row);
-            });
-          } catch (e) {
-            box.innerHTML = `<div class="path">${esc(e.message)}</div>`;
-          }
-        }
-        nav('');
+          },
+        });
       },
     });
     if (!r || !r.path) return null;
@@ -2764,6 +2809,7 @@
     try {
       const res = await api('/api/save', { json: { path: r.path, as_current: true } });
       S.path = res.path;
+      setLastDir(String(res.path).replace(/[\\/][^\\/]*$/, ''));
       await refreshDocList();
       toast('已保存到 ' + res.path, 'ok');
       return res.path;

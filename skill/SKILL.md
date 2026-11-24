@@ -97,6 +97,7 @@ pdfx search "a.pdf" "要核对的词"          # 4. 验证：新内容能搜到�
 | 渲染预览 | `pdfx render a.pdf --page 0 --dpi 150 -o p0.png` |
 | 批量分割 | `pdfx split a.pdf --ranges "1-10,11-30,31-40" -d out/`（1 基闭区间，`1-10:封面` 可起名）／`--every 50` 每 50 页一份／`--toc --level 1` 按目录章切；`--dry-run` 只看不写；`--overwrite` 覆盖同名 |
 | 起服务 | `pdfx serve a.pdf --port 8765` （浏览器编辑器 + REST API） |
+| 文件浏览 | `GET /api/browse?dir=D:\教材` → `{dir, parent, roots:[{name:"C:",path:"C:\"}…], items}`；`fallback=1` 时目录不存在自动退到最近存在的上级（并回 `requested`）。前端打开/保存/分割三个浏览框都带盘符条，不绑定 C 盘 |
 
 所有命令默认输出**单行 JSON**：`{"ok":true,"data":{...},"warnings":[]}`；失败退出码非 0 且
 `{"ok":false,"error":{"code":"...","message":"..."}}`。加 `--pretty` 缩进、`--human` 输出人读文本。

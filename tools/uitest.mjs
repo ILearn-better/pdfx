@@ -1588,6 +1588,103 @@ async function main() {
     && document.querySelector('#btn-inspector').click()`);
   await sleep(400);
 
+  /* ---------------------------------------------------------------- 文件浏览换盘 */
+  console.log('\n== 文件浏览（盘符） ==');
+  // 打开框：先看盘符条
+  await ev(`document.querySelector('#btn-open').click()`);
+  await sleep(1400);
+  const drv0 = await ev(`(() => {
+    const box = document.querySelector('#browser');
+    if (!box) return null;
+    const ds = [...box.querySelectorAll('.drive')];
+    const pathEl = box.querySelector('.path');
+    return {
+      n: ds.length, names: ds.map((b) => b.textContent.trim()),
+      barSticky: ds.length ? getComputedStyle(ds[0].parentElement).position : '',
+      path: pathEl ? pathEl.textContent : '',
+      up: [...box.querySelectorAll('.item')].some((i) => i.textContent.includes('上级')),
+      items: box.querySelectorAll('.item').length,
+    };
+  })()`);
+  check('打开框里有盘符条（不再只有 C 盘一条路）',
+    !!drv0 && drv0.n >= 1 && drv0.path.length > 2 && drv0.items > 0,
+    drv0 ? `${drv0.n} 个盘：${drv0.names.join(' / ')}｜当前 ${drv0.path}` : '找不到浏览框');
+  check('盘符条吸顶（列表滚动时不跟着滚走）',
+    !!drv0 && drv0.barSticky === 'sticky', drv0 ? drv0.barSticky : '');
+
+  // 切到最后一个盘（本机有多个盘才测；一个盘时直接跳过，不假失败）
+  let drv1 = null;
+  if (drv0 && drv0.n >= 2) {
+    await ev(`(() => {
+      const ds = [...document.querySelectorAll('#browser .drive')];
+      ds[ds.length - 1].click();
+    })()`);
+    await sleep(900);
+    drv1 = await ev(`(() => {
+      const box = document.querySelector('#browser');
+      return {
+        path: box.querySelector('.path').textContent,
+        on: [...box.querySelectorAll('.drive.on')].map((b) => b.textContent.trim()),
+        up: [...box.querySelectorAll('.item')].some((i) => i.textContent.includes('上级')),
+        dirs: [...box.querySelectorAll('.item')].filter((i) => i.textContent.includes('📁')).length,
+      };
+    })()`);
+    check('点另一个盘就切过去了，当前盘高亮',
+      drv1.on.length === 1 && drv1.path.toLowerCase().startsWith(drv1.on[0].toLowerCase()),
+      `切到 ${drv1.path}（高亮 ${drv1.on.join('')}）`);
+    check('盘符根不再显示「上级目录」', drv1.up === false, `根目录 ${drv1.path}`);
+
+    // 进一个子目录，上级应当回来
+    if (drv1.dirs > 0) {
+      await ev(`(() => {
+        const it = [...document.querySelectorAll('#browser .item')].find((i) => i.textContent.includes('📁'));
+        it.click();
+      })()`);
+      await sleep(900);
+      const drv2 = await ev(`(() => {
+        const box = document.querySelector('#browser');
+        return { path: box.querySelector('.path').textContent,
+                 up: [...box.querySelectorAll('.item')].some((i) => i.textContent.includes('上级')) };
+      })()`);
+      check('进了子目录「上级目录」又回来了', drv2.up === true, drv2.path);
+    } else {
+      check('进了子目录「上级目录」又回来了', true, '该盘根下没有子目录，跳过');
+    }
+  } else {
+    check('点另一个盘就切过去了，当前盘高亮', true, '本机只有一个盘，跳过');
+    check('盘符根不再显示「上级目录」', true, '本机只有一个盘，跳过');
+    check('进了子目录「上级目录」又回来了', true, '本机只有一个盘，跳过');
+  }
+  await shot('browse-drives');
+  await ev(`document.querySelector('#modal-x').click()`);
+  await sleep(400);
+
+  // 保存框：输入框的目录要和浏览框一致（以前浏览框固定从 home 开始，输入框却在别的盘）
+  await ev(`document.querySelector('.menu[data-menu="file"] .menu-btn').click()`);
+  await sleep(220);
+  await ev(`document.querySelector('#btn-saveas').click()`);
+  await sleep(1500);
+  const sbox = await ev(`(() => {
+    const box = document.querySelector('#s-browser');
+    const input = document.querySelector('#s-path');
+    if (!box || !input) return null;
+    const pathEl = box.querySelector('.path');
+    return { drives: box.querySelectorAll('.drive').length,
+             browseDir: pathEl ? pathEl.textContent : '',
+             value: input.value };
+  })()`);
+  const normP = (s) => String(s || '').replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
+  check('保存框也有盘符条',
+    !!sbox && sbox.drives >= 1 && sbox.browseDir.length > 2,
+    sbox ? `${sbox.drives} 个盘｜${sbox.browseDir}` : '找不到保存框');
+  check('保存框的浏览位置与路径框一致',
+    !!sbox && normP(sbox.value).startsWith(normP(sbox.browseDir))
+      && normP(sbox.value).split('/').length === normP(sbox.browseDir).split('/').length + 1,
+    sbox ? `${sbox.browseDir}  ⟷  ${sbox.value}` : '');
+  await shot('browse-save');
+  await ev(`document.querySelector('#modal-x').click()`);
+  await sleep(400);
+
   /* ---------------------------------------------------------------- 批量分割 */
   console.log('\n== 批量分割 ==');
   const splitDir = join(process.cwd(), 'tmp', 'uitest_split');
@@ -1625,6 +1722,33 @@ async function main() {
     sp1.shown && /分割/.test(sp1.title) && sp1.rows >= 1 && !sp1.okDisabled,
     `${sp1.title}｜${sp1.rows} 行｜${sp1.summary}`);
   check('默认输出目录与前缀都已填好', /[\\/]/.test(sp1.out) && !!sp1.prefix, `${sp1.out} ｜ ${sp1.prefix}`);
+
+  // 输出目录是新建的 <书名>_split，导之前根本不存在：浏览框要退到上级并说明，
+  // 而不是甩一屏「目录不存在」把用户堵死（顺带确认这里也能换盘）
+  await ev(`(() => { const t = document.querySelector('#sp-outdir');
+    t.value = ${JSON.stringify(splitDir + '-not-yet')}; t.dispatchEvent(new Event('input')); })()`);
+  await sleep(700);
+  await ev(`document.querySelector('#sp-browse-dir').click()`);
+  await sleep(1100);
+  const spBrowse = await ev(`(() => {
+    const box = document.querySelector('.sp-browser');
+    if (!box) return null;
+    const warn = box.querySelector('.path.warn');
+    return {
+      drives: box.querySelectorAll('.drive').length,
+      warn: warn ? warn.textContent : '',
+      dir: box.querySelector('.path') ? box.querySelector('.path').textContent : '',
+      pick: !!box.querySelector('.sp-pick-here'),
+      items: box.querySelectorAll('.item').length,
+    };
+  })()`);
+  check('分割的输出目录浏览也能换盘', !!spBrowse && spBrowse.drives >= 1 && spBrowse.items > 0,
+    spBrowse ? `${spBrowse.drives} 个盘 · ${spBrowse.items} 项 · ${spBrowse.dir}` : '找不到目录浏览');
+  check('目录还不存在时自动退到上级并说明原因',
+    !!spBrowse && /还不存在/.test(spBrowse.warn) && spBrowse.pick,
+    spBrowse ? spBrowse.warn.slice(0, 46) : '');
+  await ev(`document.querySelector('.sp-browser .sp-pick-here').click()`);
+  await sleep(700);
 
   // 改成两段各自一页
   await ev(`(() => { const t = document.querySelector('#sp-ranges');

@@ -10,7 +10,9 @@ import os
 import subprocess
 import sys
 import time
+import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -296,6 +298,31 @@ def main() -> int:
     ok_all &= check("GET /api/caps", "text.transform" in caps.get("caps", []), f"{len(caps.get('caps', []))} 项能力")
     ok_all &= check("能力清单里声明了批量分割", "split.batch" in caps.get("caps", []),
                     str([c for c in caps.get("caps", []) if c.startswith("split")]))
+
+    # ---- 文件浏览：能不能换盘 ----
+    home = call("/api/browse?fallback=1")["data"]
+    ok_all &= check("GET /api/browse 返回可切换的根目录",
+                    isinstance(home.get("roots"), list) and len(home["roots"]) >= 1
+                    and all("name" in r and "path" in r for r in home["roots"]),
+                    " / ".join(r["name"] for r in home["roots"]))
+    if sys.platform == "win32":
+        names = [r["name"] for r in home["roots"]]
+        ok_all &= check("Windows 上至少列出 C:", "C:" in names, ", ".join(names))
+        root = home["roots"][0]["path"]
+        at_root = call("/api/browse?fallback=1&dir=" + urllib.parse.quote(root))["data"]
+        ok_all &= check("到了盘符根就没有「上级目录」",
+                        at_root["parent"] == "" and at_root["dir"] == root,
+                        f"dir={at_root['dir']} parent={at_root['parent']!r}")
+
+    missing = Path(tempfile.gettempdir()) / "pdfx_no_such_dir_12345" / "child"
+    bad = call_err("/api/browse?dir=" + urllib.parse.quote(str(missing)))
+    ok_all &= check("目录不存在时仍然报 not_found（接口语义不变）",
+                    bad.get("error", {}).get("code") == "not_found",
+                    bad.get("error", {}).get("code", ""))
+    fb = call("/api/browse?fallback=1&dir=" + urllib.parse.quote(str(missing)))["data"]
+    ok_all &= check("带 fallback=1 时回落到上级，并回报原始路径",
+                    Path(fb["dir"]).is_dir() and fb["requested"] != fb["dir"],
+                    f"{fb['requested']} → {fb['dir']}")
 
     und = call("/api/undo", {})["data"]
     ok_all &= check("POST /api/undo", und.get("undone") is True)

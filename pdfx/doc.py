@@ -534,6 +534,13 @@ class PDFDocument(TextMixin, ImageMixin, InkMixin, SearchMixin):
         self._persist_state()
 
         same = self.path is not None and target == self.path
+        # 用户可能直接手输一个新目录（D:\新资料\a.pdf）：自己建出来，
+        # 别让 fitz 甩一句 "No such file or directory"
+        if not target.parent.exists():
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise PdfxError(f"无法创建目录 {target.parent}: {exc}", "save_failed") from exc
         try:
             if incremental and same:
                 self.doc.saveIncr()
