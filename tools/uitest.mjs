@@ -1709,19 +1709,75 @@ async function main() {
   await sleep(900);
   const menuAutoClosed = await ev(`!document.querySelector('.menu.open')`);
   check('点了菜单项后菜单自动收起', menuAutoClosed);
-  const sp1 = await ev(`(() => ({
-    shown: document.querySelector('#modal').classList.contains('show'),
-    title: document.querySelector('#modal-title').textContent,
-    rows: document.querySelectorAll('#sp-rows tr').length,
-    out: document.querySelector('#sp-outdir').value,
-    prefix: document.querySelector('#sp-prefix').value,
-    summary: document.querySelector('#sp-summary').textContent,
-    okDisabled: !!document.querySelector('#modal-foot .btn.primary').disabled,
-  }))()`);
+  const sp1 = await ev(`(() => {
+    const p = document.querySelector('#split-panel');
+    const insp = document.querySelector('#inspector');
+    const stage = document.querySelector('#stage-wrap');
+    const l = document.querySelector('.layout');
+    const r = p.getBoundingClientRect();
+    const s = stage.getBoundingClientRect();
+    const i = insp.getBoundingClientRect();
+    const ok = document.querySelector('#sp-start');
+    const okr = ok.getBoundingClientRect();
+    return {
+      shown: !p.hidden && p.getAttribute('aria-hidden') === 'false',
+      splitCls: l.classList.contains('split-open'),
+      panelW: Math.round(r.width), stageW: Math.round(s.width), inspW: Math.round(i.width),
+      inspHidden: getComputedStyle(insp).display === 'none',
+      modal: document.querySelector('#modal').classList.contains('show'),
+      head: document.querySelector('.sp-title').textContent.trim(),
+      rows: document.querySelectorAll('#sp-rows tr').length,
+      out: document.querySelector('#sp-outdir').value,
+      prefix: document.querySelector('#sp-prefix').value,
+      summary: document.querySelector('#sp-summary').textContent,
+      okDisabled: !!ok.disabled,
+      okInPanel: okr.width > 40 && okr.left >= r.left - 1 && okr.right <= r.right + 1
+        && okr.bottom <= innerHeight + 1,
+      pages: document.querySelectorAll('#pages .pbox').length,
+      topOn: document.querySelector('#btn-inspector').classList.contains('active'),
+      noOverlap: Math.round(s.right) <= Math.round(r.left) + 1,
+      inspStored: (() => { try { return localStorage.getItem('pdfx.insp'); } catch (e) { return 'n/a'; } })(),
+    };
+  })()`);
+  check('分割改用右侧栏显示，不再弹窗',
+    sp1.shown && sp1.splitCls && !sp1.modal && sp1.panelW >= 340 && sp1.head === '批量分割',
+    `栏宽 ${sp1.panelW}px`);
+  check('分割栏顶掉对象面板、画布不被盖住',
+    sp1.inspHidden && sp1.inspW <= 2 && sp1.noOverlap && sp1.pages >= 1,
+    `对象面板 ${sp1.inspW}px｜画布 ${sp1.stageW}px｜${sp1.pages} 页可见`);
   check('点开就是实时预览（已有一段示例范围）',
-    sp1.shown && /分割/.test(sp1.title) && sp1.rows >= 1 && !sp1.okDisabled,
-    `${sp1.title}｜${sp1.rows} 行｜${sp1.summary}`);
+    sp1.rows >= 1 && !sp1.okDisabled, `${sp1.rows} 行｜${sp1.summary}`);
   check('默认输出目录与前缀都已填好', /[\\/]/.test(sp1.out) && !!sp1.prefix, `${sp1.out} ｜ ${sp1.prefix}`);
+  check('「开始分割」按钮在栏内可见', sp1.okInPanel);
+  check('分割栏开着时顶栏面板按钮仍算展开', sp1.topOn);
+  await shot('split-form');
+
+  // 窄窗口：栏窄到 360px 也要留住「开始分割」，且不许把整页顶出横向滚动条
+  for (const vw of [1100, 980]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: vw, height: 900, deviceScaleFactor: 1, mobile: false,
+    });
+    await sleep(460);
+    const g = await ev(`(() => {
+      const p = document.querySelector('#split-panel');
+      const r = p.getBoundingClientRect();
+      const s = document.querySelector('#stage-wrap').getBoundingClientRect();
+      const b = document.querySelector('#sp-start').getBoundingClientRect();
+      return {
+        panelW: Math.round(r.width), stageW: Math.round(s.width),
+        panelIn: r.left >= 0 && Math.round(r.right) <= innerWidth,
+        btnIn: b.width > 40 && b.right <= innerWidth + 1 && Math.round(b.right) <= Math.round(r.right) + 1,
+        hscroll: document.documentElement.scrollWidth > innerWidth + 1,
+      };
+    })()`);
+    check(`${vw}px 窗口下分割栏完整、按钮没被挤出去`,
+      g.panelIn && g.btnIn && !g.hscroll && g.stageW > 240,
+      `栏 ${g.panelW}px｜画布 ${g.stageW}px`);
+  }
+  await cdp.send('Emulation.setDeviceMetricsOverride', {
+    width: 1440, height: 900, deviceScaleFactor: 1, mobile: false,
+  });
+  await sleep(460);
 
   // 输出目录是新建的 <书名>_split，导之前根本不存在：浏览框要退到上级并说明，
   // 而不是甩一屏「目录不存在」把用户堵死（顺带确认这里也能换盘）
@@ -1772,7 +1828,7 @@ async function main() {
   await sleep(700);
   const spToc = await ev(`(() => ({
     text: document.querySelector('#sp-rows').innerText.trim(),
-    disabled: !!document.querySelector('#modal-foot .btn.primary').disabled,
+    disabled: !!document.querySelector('#sp-start').disabled,
   }))()`);
   check('没有书签的文档选「按目录」会说明原因并禁用开始',
     /没有可用目录|没有目录/.test(spToc.text) && spToc.disabled, spToc.text.slice(0, 40));
@@ -1786,7 +1842,7 @@ async function main() {
   await ev(`(() => { const t = document.querySelector('#sp-ranges');
     t.value = '1-1\\n2-2'; t.dispatchEvent(new Event('input')); })()`);
   await sleep(800);
-  await ev(`document.querySelector('#modal-foot .btn.primary').click()`);
+  await ev(`document.querySelector('#sp-start').click()`);
   let spDone = null;
   for (let i = 0; i < 80; i++) {
     spDone = await ev(`(() => {
@@ -1803,7 +1859,7 @@ async function main() {
   check('结果文件真的写到了磁盘上', onDisk.length === 2, onDisk.join(' / '));
   check('结果里的文件名与磁盘一致',
     !!spDone && spDone.files.every((f) => onDisk.includes(f)), (spDone ? spDone.files : []).join(' / '));
-  check('完成后弹窗里不再重复出现表单', spDone ? !/页码范围/.test(spDone.text) : false);
+  check('完成后结果区不再重复出现表单', spDone ? !/页码范围/.test(spDone.text) : false);
   await shot('split-done');
 
   // 再分一批：回到表单，应该重新预览
@@ -1812,13 +1868,64 @@ async function main() {
   const spAgain = await ev(`(() => ({
     formShown: !document.querySelector('#sp-form').hidden,
     doneShown: !document.querySelector('#sp-done').hidden,
-    okText: document.querySelector('#modal-foot .btn.primary').textContent.trim(),
+    okText: document.querySelector('#sp-start').textContent.trim(),
+    footShown: !document.querySelector('#split-foot').hidden,
   }))()`);
-  check('「再分一批」回到表单且预填还在', spAgain.formShown && !spAgain.doneShown && /开始分割/.test(spAgain.okText),
+  check('「再分一批」回到表单且预填还在',
+    spAgain.formShown && !spAgain.doneShown && /开始分割/.test(spAgain.okText) && spAgain.footShown,
     spAgain.okText);
-  await ev(`document.querySelector('#modal-x').click()`);
-  await sleep(300);
-  check('关掉弹窗后遮罩消失', !(await ev(`document.querySelector('#modal').classList.contains('show')`)));
+
+  // 收起分割栏：右侧那一列交还对象面板，画布回到原宽
+  const beforeClose = await ev(`(() => ({
+    stage: Math.round(document.querySelector('#stage-wrap').getBoundingClientRect().width),
+    insp: Math.round(document.querySelector('#inspector').getBoundingClientRect().width),
+  }))()`);
+  await ev(`document.querySelector('#sp-close').click()`);
+  await sleep(600);
+  const spClosed = await ev(`(() => ({
+    hidden: document.querySelector('#split-panel').hidden,
+    aria: document.querySelector('#split-panel').getAttribute('aria-hidden'),
+    splitCls: document.querySelector('.layout').classList.contains('split-open'),
+    modal: document.querySelector('#modal').classList.contains('show'),
+    inspW: Math.round(document.querySelector('#inspector').getBoundingClientRect().width),
+    stageW: Math.round(document.querySelector('#stage-wrap').getBoundingClientRect().width),
+    pages: document.querySelectorAll('#pages .pbox').length,
+  }))()`);
+  check('收起分割栏后对象面板回来、画布变宽',
+    spClosed.hidden && spClosed.aria === 'true' && !spClosed.splitCls && !spClosed.modal
+      && spClosed.inspW > 290 && spClosed.stageW > beforeClose.stage,
+    `画布 ${beforeClose.stage} → ${spClosed.stageW}，对象面板 ${spClosed.inspW}px`);
+  check('收起分割栏不丢页面', spClosed.pages >= 1);
+
+  // 再打开一次：面板 DOM 不重建，填过的内容还在（这正是栏比弹窗好用的地方）
+  await ev(`document.querySelector('.menu[data-menu="feat"] .menu-btn').click()`);
+  await sleep(200);
+  await ev(`document.querySelector('#btn-split').click()`);
+  await sleep(700);
+  const spReopen = await ev(`(() => {
+    const p = document.querySelector('#split-panel');
+    const r = p.getBoundingClientRect();
+    const s = document.querySelector('#stage-wrap').getBoundingClientRect();
+    return {
+      shown: !p.hidden, rows: document.querySelectorAll('#sp-rows tr').length,
+      out: document.querySelector('#sp-outdir').value,
+      pages: document.querySelectorAll('#pages .pbox').length,
+      noOverlap: Math.round(s.right) <= Math.round(r.left) + 1,
+    };
+  })()`);
+  check('重新展开分割栏时内容不重置、页面还在',
+    spReopen.shown && spReopen.rows === 2 && /uitest_split/.test(spReopen.out)
+      && spReopen.pages >= 1 && spReopen.noOverlap,
+    `${spReopen.rows} 行｜${spReopen.out}`);
+  // 顶栏的面板按钮在分割栏开着时 = 收起分割、回到对象面板
+  await ev(`document.querySelector('#btn-inspector').click()`);
+  await sleep(600);
+  const spBack = await ev(`(() => ({
+    hidden: document.querySelector('#split-panel').hidden,
+    inspW: Math.round(document.querySelector('#inspector').getBoundingClientRect().width),
+  }))()`);
+  check('顶栏面板按钮能收起分割栏并回到对象面板',
+    spBack.hidden && spBack.inspW > 290, `对象面板 ${spBack.inspW}px`);
 
   console.log(`\n合计 ${pass} 项通过，${fail} 项失败`);
   if (errors.length) {
