@@ -19,6 +19,7 @@ import json
 import mimetypes
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -242,31 +243,85 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _drive_roots() -> list[dict[str, str]]:
-    """可切换的根目录：Windows 是盘符，其它平台就是 /。
+# GetDriveTypeW 的返回值 → 中文说明（只用在按钮悬浮提示里，认不出就不显示）
+_DRIVE_KIND = {1: "无效", 2: "可移动磁盘", 3: "本地磁盘", 4: "网络位置", 5: "光驱", 6: "内存盘"}
 
-    只有「↑ 上级目录」是不够的：Windows 上 ``C:\\`` 的 parent 还是 ``C:\\``，
+
+def _windows_roots_ctypes() -> "list[dict[str, str]] | None":
+    """用 GetLogicalDrives 的位掩码枚举盘符，拿不到返回 None。
+
+    为什么不逐个 ``os.path.exists("A:\\\\")``：脱机的网络盘符会让它卡到 SMB 超时
+    （单个数十秒），26 个字母扫完能卡到让人以为程序死了。位掩码只问系统登记了哪些
+    盘符，不碰介质，瞬间返回。
+    """
+    try:
+        import ctypes
+
+        k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        k32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
+        k32.GetDriveTypeW.restype = ctypes.c_int
+        mask = int(k32.GetLogicalDrives())
+    except Exception:  # pragma: no cover - 被裁剪过的运行环境
+        return None
+    out: list[dict[str, str]] = []
+    for i in range(26):
+        if not (mask >> i) & 1:
+            continue
+        letter = chr(65 + i)
+        root = f"{letter}:\\"
+        try:
+            kind = _DRIVE_KIND.get(int(k32.GetDriveTypeW(root)), "")
+        except Exception:  # pragma: no cover - 盘符刚被拔掉
+            kind = ""
+        out.append({"name": f"{letter}:", "path": root, "kind": kind})
+    return out
+
+
+def _windows_roots_probe() -> list[dict[str, str]]:
+    """兜底：真拿不到位掩码时，逐个字母试。慢，但总比没有盘可换好。"""
+    out: list[dict[str, str]] = []
+    for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        root = f"{ch}:\\"
+        try:
+            if os.path.exists(root):
+                out.append({"name": f"{ch}:", "path": root, "kind": ""})
+        except OSError:
+            continue
+    return out
+
+
+def _posix_roots() -> list[dict[str, str]]:
+    """macOS / Linux：/ 之外再给几个常见挂载点，外接盘才点得到。"""
+    out: list[dict[str, str]] = [{"name": "/", "path": "/", "kind": "系统根"}]
+    if sys.platform == "darwin":
+        cands = ["/Volumes"]  # 外接硬盘、U 盘、DMG 都挂这儿
+    else:
+        user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+        cands = ["/media", "/mnt"] + ([f"/run/media/{user}"] if user else [])
+    for d in cands:
+        try:
+            if Path(d).is_dir() and all(r["path"] != d for r in out):
+                out.append({"name": d, "path": d, "kind": "挂载点"})
+        except OSError:
+            continue
+    return out
+
+
+def _drive_roots() -> list[dict[str, str]]:
+    """可切换的根目录 —— **每次请求现问系统要**，不缓存、不写死。
+
+    同一份代码在 A 机器是 C:/Q:，到 B 机器可能是 C:/D:/E:，所以盘符只能枚举；
+    任何"本机有哪些盘"的假设都会在换设备后失效。
+
+    只有「↑ 上级目录」也不够：Windows 上 ``C:\\`` 的 parent 还是 ``C:\\``，
     走到根就卡住，D 盘上的文件必须先拷到 C 盘才打得开。
     """
     if os.name != "nt":
-        return [{"name": "/", "path": "/"}]
-    paths: list[str] = []
-    try:  # Python 3.12+
-        paths = list(os.listdrives())  # type: ignore[attr-defined]
-    except AttributeError:
-        for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-            root = f"{ch}:\\"
-            try:
-                if os.path.exists(root):
-                    paths.append(root)
-            except OSError:
-                continue
-    out: list[dict[str, str]] = []
-    for root in paths:
-        name = root.rstrip("\\/")
-        if name:
-            out.append({"name": name, "path": str(Path(root))})
-    return out
+        return _posix_roots()
+    roots = _windows_roots_ctypes()
+    if roots is None:  # pragma: no cover
+        roots = _windows_roots_probe()
+    return roots
 
 
 def _nearest_dir(p: Path, limit: int = 12) -> "Path | None":
@@ -896,13 +951,18 @@ def create_app(initial: str | None = None) -> Flask:
         except OSError:
             pass
         requested = str(p)
+        fell_back = ""
         if not p.exists() or not p.is_dir():
             # 前端浏览框带着 fallback=1 来：目录还没建（比如分割的默认输出目录）就退到上级，
             # 而不是甩一屏 red 错误。直接调接口的脚本仍然拿到 404，语义不偷偷变。
             if request.args.get("fallback") in ("1", "true", "yes"):
                 near = _nearest_dir(p)
                 if near is not None:
-                    p = near
+                    p, fell_back = near, "parent"
+                else:
+                    # 整个盘符都不在这台机器上 —— 常见于「在 A 电脑记住了 Q:\教材，
+                    # 到 B 电脑打开」：往上退无可退，就直接回用户目录，别让浏览框一开就报错。
+                    p, fell_back = Path.home(), "home"
             if not p.exists() or not p.is_dir():
                 raise PdfxError(f"目录不存在: {p}", "not_found")
         items = []
@@ -934,6 +994,8 @@ def create_app(initial: str | None = None) -> Flask:
         return {
             "dir": str(p),
             "requested": requested,
+            # parent=上级目录回落，home=连盘符都没有（换设备）回落，空=没回落
+            "fallback": fell_back,
             "parent": parent,
             "roots": _drive_roots(),
             "items": items,

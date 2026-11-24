@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -305,10 +306,28 @@ def main() -> int:
                     isinstance(home.get("roots"), list) and len(home["roots"]) >= 1
                     and all("name" in r and "path" in r for r in home["roots"]),
                     " / ".join(r["name"] for r in home["roots"]))
+    roots = home["roots"]
+    # 盘符是这台机器现枚举的：换个设备（盘符不同、数量不同）也得照样成立，
+    # 所以这里只说"每个根都真实存在、都带系统报的类型"，不假设任何具体字母。
+    # 网络盘/光驱可能没连上、没放盘，碰一下就卡几十秒 —— 这两类不探存在性。
+    local_roots = [r for r in roots if r.get("kind") not in ("网络位置", "光驱")]
+    ok_all &= check("每个根目录都真实存在",
+                    all(Path(r["path"]).is_dir() for r in local_roots),
+                    ", ".join(r["path"] for r in local_roots))
+    ok_all &= check("根目录不重复、名字规范",
+                    len({r["path"].lower() for r in roots}) == len(roots)
+                    and all(re.fullmatch(r"[A-Z]:|/.*", r["name"]) for r in roots),
+                    ", ".join(r["name"] for r in roots))
     if sys.platform == "win32":
-        names = [r["name"] for r in home["roots"]]
-        ok_all &= check("Windows 上至少列出 C:", "C:" in names, ", ".join(names))
-        root = home["roots"][0]["path"]
+        names = [r["name"] for r in roots]
+        sysdrive = (os.environ.get("SystemDrive") or "C:") + "\\"
+        ok_all &= check("系统盘一定在列表里（不写死 C:）",
+                        any(os.path.normcase(r["path"]) == os.path.normcase(sysdrive) for r in roots),
+                        f"系统盘 {sysdrive}｜{', '.join(names)}")
+        ok_all &= check("盘符带类型（系统报的本地/网络/光驱）",
+                        all(r.get("kind") for r in roots),
+                        " ".join(f"{r['name']}{r['kind']}" for r in roots))
+        root = roots[0]["path"]
         at_root = call("/api/browse?fallback=1&dir=" + urllib.parse.quote(root))["data"]
         ok_all &= check("到了盘符根就没有「上级目录」",
                         at_root["parent"] == "" and at_root["dir"] == root,
@@ -321,8 +340,25 @@ def main() -> int:
                     bad.get("error", {}).get("code", ""))
     fb = call("/api/browse?fallback=1&dir=" + urllib.parse.quote(str(missing)))["data"]
     ok_all &= check("带 fallback=1 时回落到上级，并回报原始路径",
-                    Path(fb["dir"]).is_dir() and fb["requested"] != fb["dir"],
-                    f"{fb['requested']} → {fb['dir']}")
+                    Path(fb["dir"]).is_dir() and fb["requested"] != fb["dir"]
+                    and fb.get("fallback") == "parent",
+                    f"{fb['requested']} → {fb['dir']}（{fb.get('fallback')}）")
+
+    # 「换了台电脑」：上次记住的目录在别的盘符上，这台机器压根没这个盘。
+    # 往上退无可退时应当回到用户目录，而不是让浏览框一打开就报错。
+    if sys.platform == "win32":
+        used = {(r["name"][0]).upper() for r in roots}
+        ghost = next((c for c in "ZYXWVUTSRQPONMLKJIHGFEDCB" if c not in used), "Z")
+        ghost_dir = f"{ghost}:\\教材\\第一册"
+        gfb = call("/api/browse?fallback=1&dir=" + urllib.parse.quote(ghost_dir))["data"]
+        ok_all &= check("别的设备记下的盘符不存在时回落到用户目录",
+                        Path(gfb["dir"]).is_dir() and gfb.get("fallback") == "home"
+                        and Path(gfb["dir"]) == Path.home(),
+                        f"{ghost_dir} → {gfb['dir']}（{gfb.get('fallback')}）")
+        gbad = call_err("/api/browse?dir=" + urllib.parse.quote(ghost_dir))
+        ok_all &= check("不带 fallback 时该路径仍然是 not_found（语义不变）",
+                        gbad.get("error", {}).get("code") == "not_found",
+                        gbad.get("error", {}).get("code", ""))
 
     und = call("/api/undo", {})["data"]
     ok_all &= check("POST /api/undo", und.get("undone") is True)

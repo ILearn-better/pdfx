@@ -9,6 +9,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const BASE_ARG = process.argv[2];
@@ -16,17 +17,26 @@ const PORT_SVC = 8800 + Math.floor(Math.random() * 180);
 const PORT = 9100 + Math.floor(Math.random() * 400);
 let BASE = BASE_ARG || `http://127.0.0.1:${PORT_SVC}`;
 
+/* 浏览器装在哪台机器上都不一样（系统盘不一定是 C:，Chrome 也可能只在用户目录），
+   所以先用环境变量定位，再退回常见的安装位置，最后允许 CHROME_PATH 直接指定。 */
+const PF = process.env['ProgramFiles'] || 'C:\\Program Files';
+const PF86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+const LOCAL = process.env['LOCALAPPDATA'] || '';
 const CANDIDATES = [
-  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-];
+  process.env['CHROME_PATH'],
+  join(PF86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+  join(PF, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+  join(PF, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+  join(PF86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+  LOCAL && join(LOCAL, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+].filter(Boolean);
 const BIN = CANDIDATES.find((p) => existsSync(p));
 if (!BIN) {
-  console.error('[x] 找不到 Edge 或 Chrome');
+  console.error('[x] 找不到 Edge 或 Chrome（可用 CHROME_PATH 指定完整路径）');
   process.exit(2);
 }
+// 浏览器配置目录放系统临时目录：C:\Temp 不是每台机器都有，临时目录一定可写
+const PROFILE = join(tmpdir(), `pdfx-uitest-${PORT}`);
 
 let pass = 0;
 let fail = 0;
@@ -148,7 +158,7 @@ async function main() {
       '--no-first-run',
       '--hide-scrollbars',
       `--remote-debugging-port=${PORT}`,
-      `--user-data-dir=C:\\Temp\\pdfx-uitest-${PORT}`,
+      `--user-data-dir=${PROFILE}`,
       '--window-size=1440,900',
       BASE + '/',
     ],
@@ -1659,6 +1669,47 @@ async function main() {
   await ev(`document.querySelector('#modal-x').click()`);
   await sleep(400);
 
+  /* 盘符必须是"这台电脑现问系统要的"。界面上的按钮要和后端返回的 roots 逐一对应，
+     换到 2 个盘的机器、5 个盘的机器都成立 —— 任何写死的 C:/Q: 组合都会在这里露出来。 */
+  const rootsNow = await ev(`(async () => {
+    const r = await (await fetch('/api/browse')).json();
+    return (r.data && r.data.roots) || [];
+  })()`);
+  check('盘符条与后端枚举完全一致（没写死 C:/Q:）',
+    Array.isArray(rootsNow) && rootsNow.length === drv0.n
+      && rootsNow.every((rt) => drv0.names.includes(rt.name)),
+    `${rootsNow.length} 个（${rootsNow.map((x) => x.name).join('/')}）vs 界面 ${drv0.names.join('/')}`);
+  check('每个盘符带类型（系统 GetDriveTypeW 报的，不是猜的）',
+    Array.isArray(rootsNow) && rootsNow.every((rt) => rt.kind),
+    rootsNow.map((x) => `${x.name}${x.kind}`).join(' '));
+
+  // 模拟"换了台电脑"：这台机器上根本没有上次记住的那个盘符
+  const usedLetters = new Set(rootsNow.map((rt) => String(rt.name).replace(':', '').toUpperCase()));
+  const ghostLetter = 'ZYXWVUTSRQPONMLKJIHGFEDCB'.split('').find((c) => !usedLetters.has(c)) || 'Z';
+  const ghostPath = `${ghostLetter}:\\教材\\第一册`;
+  await ev(`localStorage.setItem('pdfx.lastDir', ${JSON.stringify(ghostPath)})`);
+  await ev(`document.querySelector('#btn-open').click()`);
+  await sleep(1700);
+  const ghostBox = await ev(`(() => {
+    const box = document.querySelector('#browser');
+    if (!box) return null;
+    const warn = box.querySelector('.path.warn');
+    return {
+      path: box.querySelector('.path') ? box.querySelector('.path').textContent : '',
+      warn: warn ? warn.textContent : '',
+      drives: box.querySelectorAll('.drive').length,
+      items: box.querySelectorAll('.item').length,
+      died: box.textContent.includes('回到我的文档'),
+    };
+  })()`);
+  check('别的设备记下的盘符不存在时，不甩错误屏、直接给可用目录',
+    !!ghostBox && !ghostBox.died && ghostBox.items > 0 && ghostBox.drives >= 1,
+    ghostBox ? `${ghostPath} → ${ghostBox.path}｜${ghostBox.items} 项` : '找不到浏览框');
+  check('并说明是"这台电脑上不存在"',
+    !!ghostBox && /这台电脑上不存在/.test(ghostBox.warn), ghostBox ? ghostBox.warn : '');
+  await ev(`document.querySelector('#modal-x').click()`);
+  await sleep(400);
+
   // 保存框：输入框的目录要和浏览框一致（以前浏览框固定从 home 开始，输入框却在别的盘）
   await ev(`document.querySelector('.menu[data-menu="file"] .menu-btn').click()`);
   await sleep(220);
@@ -1936,6 +1987,8 @@ async function main() {
   ws.close();
   killTree(proc);
   if (svc) killTree(svc);
+  // 浏览器配置目录是本次临时造的，跑完就删，别在别的机器上越积越多
+  try { rmSync(PROFILE, { recursive: true, force: true }); } catch (e) { /* 进程还没退干净就留着 */ }
   process.exit(fail === 0 ? 0 : 1);
 }
 

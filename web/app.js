@@ -2034,16 +2034,24 @@
     let roots = [];
     async function nav(p) {
       let r = null;
+      // 盘符是后端每次现枚举的（换台电脑就换成那台电脑的盘），这里不做任何假设。
+      // 但要防一种情况：点到脱机的网络盘 / 没放盘的光驱，Windows 会一直等到超时，
+      // 页面就那样卡着，连"出错"都没有。20 秒收工，给句人话。
+      const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+      const timer = setTimeout(() => { if (ctl) ctl.abort(); }, 20000);
       try {
         const qs = ['fallback=1'];
         if (p) qs.push('dir=' + encodeURIComponent(p));
-        r = await api('/api/browse?' + qs.join('&'));
+        r = await api('/api/browse?' + qs.join('&'), ctl ? { signal: ctl.signal } : {});
       } catch (e) {
         // 真的进不去（权限不足、盘符被拔掉）：别把整个浏览器弄死，给条退路
+        const msg = (e && e.name === 'AbortError')
+          ? '这个位置 20 秒没有响应 —— 网络盘可能没连上，或光驱里没放盘'
+          : e.message;
         box.innerHTML = '';
         const bad = document.createElement('div');
         bad.className = 'path warn';
-        bad.textContent = e.message;
+        bad.textContent = msg;
         box.appendChild(bad);
         const back = document.createElement('div');
         back.className = 'item';
@@ -2051,6 +2059,8 @@
         back.onclick = () => nav('');
         box.appendChild(back);
         return;
+      } finally {
+        clearTimeout(timer);
       }
       roots = (r.roots && r.roots.length) ? r.roots : roots;
       setLastDir(r.dir);
@@ -2066,7 +2076,8 @@
           b.type = 'button';
           b.className = 'drive' + (rt.path.toLowerCase() === r.dir.toLowerCase() ? ' on' : '');
           b.textContent = rt.name;
-          b.title = rt.path;
+          b.title = rt.kind ? `${rt.path}（${rt.kind}）` : rt.path;
+          b.dataset.kind = rt.kind || '';
           b.onclick = () => nav(rt.path);
           bar.appendChild(b);
         });
@@ -2084,7 +2095,10 @@
       if (r.requested && norm(r.requested) !== norm(r.dir)) {
         const tip = document.createElement('div');
         tip.className = 'path warn';
-        tip.textContent = `${r.requested} 还不存在，已跳到上级目录`;
+        // home＝那个盘在这台电脑上根本没有（换了设备 / 盘符变了），得说清楚
+        tip.textContent = r.fallback === 'home'
+          ? `${r.requested} 在这台电脑上不存在（换了设备或盘符变了），已回到 ${r.dir}`
+          : `${r.requested} 还不存在，已跳到上级目录`;
         box.appendChild(tip);
       }
 

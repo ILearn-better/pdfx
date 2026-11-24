@@ -619,6 +619,10 @@ button { font: inherit; }
 }
 .drive:hover { border-color: #b8c0cc; background: #fafbfc; }
 .drive.on { color: var(--primary); border-color: #c7dbfb; background: var(--primary-weak); font-weight: 600; }
+/* 网络盘 / 光驱：虚线提示"不一定连得上、不一定有盘"，点了不会立刻有内容 */
+.drive[data-kind="网络位置"], .drive[data-kind="光驱"] {
+  border-style: dashed; color: var(--muted);
+}
 /* 目录不存在、已回落到上级时的说明条 */
 .path.warn, .browser .path.warn, .sp-browser .path.warn {
   color: #b26a00; background: #fff8ec; border-bottom-color: #f3dfb8;

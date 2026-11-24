@@ -97,7 +97,7 @@ pdfx search "a.pdf" "要核对的词"          # 4. 验证：新内容能搜到�
 | 渲染预览 | `pdfx render a.pdf --page 0 --dpi 150 -o p0.png` |
 | 批量分割 | `pdfx split a.pdf --ranges "1-10,11-30,31-40" -d out/`（1 基闭区间，`1-10:封面` 可起名）／`--every 50` 每 50 页一份／`--toc --level 1` 按目录章切；`--dry-run` 只看不写；`--overwrite` 覆盖同名 |
 | 起服务 | `pdfx serve a.pdf --port 8765` （浏览器编辑器 + REST API） |
-| 文件浏览 | `GET /api/browse?dir=D:\教材` → `{dir, parent, roots:[{name:"C:",path:"C:\"}…], items}`；`fallback=1` 时目录不存在自动退到最近存在的上级（并回 `requested`）。前端打开/保存/分割三个浏览框都带盘符条，不绑定 C 盘 |
+| 文件浏览 | `GET /api/browse?dir=D:\教材` → `{dir, requested, fallback, parent, roots:[{name:"C:",path:"C:\",kind:"本地磁盘"}…], items}`。`roots` **每次现枚举**（Windows: `GetLogicalDrives`+`GetDriveTypeW`，macOS/Linux: `/` 加 `/Volumes`、`/media`、`/mnt`），换设备自动变，不写死盘符；`fallback=1` 时目录不存在退到上级（`fallback:"parent"`），连盘符都不存在则回用户目录（`fallback:"home"`），不带参数仍报 `not_found` |
 
 所有命令默认输出**单行 JSON**：`{"ok":true,"data":{...},"warnings":[]}`；失败退出码非 0 且
 `{"ok":false,"error":{"code":"...","message":"..."}}`。加 `--pretty` 缩进、`--human` 输出人读文本。
@@ -372,4 +372,8 @@ id 形如 `p0:i@56,500`（左上角坐标取整），**不带 xref**。原因：
   不要用「先涂色再重画」的思路自己实现，图片区域取「边缘众数色」取到的就是图片本身。
 - **页码是 0 基，不是 1 基**。`--page 0` = 第一页；`--pages "1-3"` = 第 2、3、4 页。
   界面上显示的"第 N 页"是给人看的（1 基），API 与 CLI 一律 0 基，别混。
-- 负索引可用：`--page -1` 是最后一页。
+- **负索引可用：`--page -1` 是最后一页。**
+- **盘符不能写死、也不能逐个探测**。`roots` 必须每次现枚举：同一份代码在别的电脑上是别的盘符，
+  系统盘也未必是 C:。别用「A-Z 逐个 `os.path.exists`」——脱机的网络盘符会卡到 SMB 超时，
+  26 个字母能把界面卡死；用 `GetLogicalDrives()` 位掩码 + `GetDriveTypeW`（本工具已这么做）。
+  另外，记住的目录可能在换设备后整盘不存在，`fallback=1` 要能一路退到用户目录，而不是只退一级。
